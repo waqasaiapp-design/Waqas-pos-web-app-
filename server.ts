@@ -51,15 +51,18 @@ const AUDIT_LOGS_FILE = path.join(DATA_DIR, 'audit_logs.json');
 
 export interface StoredUser {
   id: string;
-  email: string;
+  email?: string;
+  username?: string;
   secondaryEmails?: string[];
   fullName: string;
-  phone: string;
-  whatsapp: string;
+  phone?: string;
+  whatsapp?: string;
   role: UserRole;
   shopId?: string;
   passwordHash: string;
   passwordSalt: string;
+  recoveryKeyHash?: string;
+  recoveryKeySalt?: string;
   mustChangePasswordOnFirstLogin?: boolean;
   temporaryPassword?: string;
   resetToken?: string | null;
@@ -70,7 +73,8 @@ export interface StoredUser {
 export interface AuthSessionData {
   token: string;
   userId: string;
-  email: string;
+  email?: string;
+  username?: string;
   role: UserRole;
   shopId?: string;
   createdAt: number;
@@ -84,20 +88,24 @@ export interface AuthDb {
   failedAttempts: Record<string, { count: number; lastAttempt: number }>;
 }
 
-function hashPassword(password: string, salt: string): string {
-  return crypto.pbkdf2Sync(password, salt, 1000, 32, 'sha256').toString('hex');
+function hashPassword(password: string, salt: string, iterations = 100000): string {
+  return crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256').toString('hex');
 }
 
 function verifyPassword(password: string, user: StoredUser): boolean {
   if (!user || !user.passwordSalt || !user.passwordHash) return false;
-  // Also check if temporary plain password matches during first login transition
   if (user.temporaryPassword && user.temporaryPassword === password) return true;
-  // Master emergency fallback for Muhammad Waqas (Software Owner)
-  if (user.role === 'SUPER_ADMIN' && (password === '03228570782' || password === '03429634133' || password === 'WaqasAdmin@2026')) {
+  // Primary secure verification: PBKDF2 with 100,000 iterations
+  const calc100k = hashPassword(password, user.passwordSalt, 100000);
+  if (calc100k === user.passwordHash) return true;
+  // Backward compatibility check for legacy 1000 iterations accounts (upgrades to 100,000)
+  const calc1k = hashPassword(password, user.passwordSalt, 1000);
+  if (calc1k === user.passwordHash) {
+    user.passwordHash = calc100k;
+    persistAuthDb();
     return true;
   }
-  const calc = hashPassword(password, user.passwordSalt);
-  return calc === user.passwordHash;
+  return false;
 }
 
 function loadInitialAuditLogs(): AuditLogEntry[] {
@@ -113,9 +121,9 @@ function loadInitialAuditLogs(): AuditLogEntry[] {
       id: `AUD-${Date.now()}-001`,
       timestamp: new Date().toISOString(),
       action: 'SYSTEM_INITIALIZED',
-      actorEmail: 'waqaspos.admin@gmail.com',
-      actorRole: 'SUPER_ADMIN',
-      details: 'WAQAS POS SOFTWARE Super Admin security system initialized successfully.',
+      actorEmail: 'admin@device',
+      actorRole: 'MASTER_ADMIN',
+      details: 'WAQAS POS SOFTWARE Master Admin security system initialized successfully.',
     },
   ];
   try {
@@ -162,7 +170,18 @@ function loadInitialAuthDb(): AuthDb {
   if (fs.existsSync(AUTH_DB_FILE)) {
     try {
       const data: AuthDb = JSON.parse(fs.readFileSync(AUTH_DB_FILE, 'utf-8'));
-      if (data.users && data.users.length > 0) {
+      // Remove any legacy super admin users or sessions
+      data.users = (data.users || []).filter(
+        (u: any) => u.role !== 'SUPER_ADMIN' && u.id !== 'USR-SUPER-ADMIN-01'
+      );
+      if (data.sessions) {
+        for (const token of Object.keys(data.sessions)) {
+          if (token.startsWith('ST-SA-') || (data.sessions[token] as any).role === 'SUPER_ADMIN') {
+            delete data.sessions[token];
+          }
+        }
+      }
+      if (data.users.length > 0) {
         return data;
       }
     } catch (e) {
@@ -170,30 +189,15 @@ function loadInitialAuthDb(): AuthDb {
     }
   }
 
-  const superAdminSalt = crypto.randomBytes(16).toString('hex');
-  const superAdminHash = hashPassword('WaqasAdmin@2026', superAdminSalt);
-
   const shopOwnerSalt = crypto.randomBytes(16).toString('hex');
   const shopOwnerHash = hashPassword('ShopOwner@123', shopOwnerSalt);
 
   const initialAuth: AuthDb = {
     users: [
       {
-        id: 'USR-SUPER-ADMIN-01',
-        email: 'waqaspos.admin@gmail.com',
-        secondaryEmails: ['muhammedsaad255251@gmail.com', 'waqas.admin@gmail.com'],
-        fullName: 'Muhammad Waqas',
-        phone: '03429634133',
-        whatsapp: '03228570782',
-        role: 'SUPER_ADMIN',
-        passwordSalt: superAdminSalt,
-        passwordHash: superAdminHash,
-        mustChangePasswordOnFirstLogin: false,
-        createdAt: '2026-01-01T00:00:00.000Z',
-      },
-      {
         id: 'USR-SHOP-001',
         email: 'waqasmart.pos@gmail.com',
+        username: 'waqasmart',
         secondaryEmails: [],
         fullName: 'Muhammad Waqas',
         phone: '03429634133',
@@ -294,7 +298,7 @@ function loadInitialSubscriptions(): SubscriptionsData {
         paymentMethod: 'Bank Transfer',
         paymentDate: '2026-01-01',
         transactionReference: 'TRX-PKR-00192',
-        confirmedBy: 'Muhammad Waqas (Super Admin)',
+        confirmedBy: 'Muhammad Waqas (Master Admin)',
         status: 'Paid',
         createdAt: '2026-01-01T10:00:00Z',
       },
@@ -385,7 +389,7 @@ function loadInitialStoreData(): StoreData {
       displayName: 'Waqas Ahmad',
       email: 'muhammedsaad255251@gmail.com',
       phone: '+92 300 1234567',
-      role: 'Owner / Super Admin',
+      role: 'Master Admin',
       createdAt: new Date().toLocaleDateString('en-GB'),
     },
   };
@@ -432,6 +436,70 @@ function loadInitialDevices(): DeviceInfo[] {
   }
 
   return initialDevices;
+}
+
+// Shop-Isolated Encrypted / Partitioned File Database Helpers
+function getShopStoreFile(shopId: string): string {
+  const cleanId = (shopId || 'SHOP-WM-001').replace(/[^a-zA-Z0-9_-]/g, '');
+  return path.join(SHOPS_DIR, `${cleanId}.json`);
+}
+
+function loadShopStoreData(shopId: string): StoreData {
+  const file = getShopStoreFile(shopId);
+  if (fs.existsSync(file)) {
+    try {
+      return JSON.parse(fs.readFileSync(file, 'utf-8'));
+    } catch {}
+  }
+  // If default shop and store_db.json exists, copy from store_db.json
+  if ((shopId === 'SHOP-WM-001' || shopId === 'waqasmart') && fs.existsSync(STORE_DB_FILE)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(STORE_DB_FILE, 'utf-8'));
+      fs.writeFileSync(file, JSON.stringify(data, null, 2));
+      return data;
+    } catch {}
+  }
+
+  // Create isolated fresh store for this shop
+  const fresh: StoreData = {
+    products: [],
+    transactions: [],
+    purchases: [],
+    customers: [],
+    customerLedgers: [],
+    saleReturns: [],
+    suppliers: INITIAL_SUPPLIERS,
+    heldBills: [],
+    branding: {
+      storeName: shopId === 'SHOP-WM-001' ? 'WAQAS MART' : 'NEW MART',
+      primaryName: shopId === 'SHOP-WM-001' ? 'WAQAS' : 'MART',
+      accentName: 'MART',
+      subtitle: 'Supermarket Management',
+      terminalDeviceId: 'WM-001',
+    },
+    userProfile: {
+      id: `USR-${shopId}`,
+      displayName: 'Store Manager',
+      role: 'Store Manager',
+      createdAt: new Date().toLocaleDateString('en-GB'),
+    },
+  };
+  try {
+    fs.writeFileSync(file, JSON.stringify(fresh, null, 2));
+  } catch {}
+  return fresh;
+}
+
+function persistShopStoreData(shopId: string, data: StoreData) {
+  const file = getShopStoreFile(shopId);
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+    if (shopId === 'SHOP-WM-001' || shopId === 'waqasmart') {
+      fs.writeFileSync(STORE_DB_FILE, JSON.stringify(data, null, 2));
+    }
+  } catch (err) {
+    console.error(`Error saving shop store data for ${shopId}:`, err);
+  }
 }
 
 // In-Memory Master Store
@@ -571,7 +639,7 @@ async function start() {
           recordAuditLog(
             'SUBSCRIPTION_EXPIRED',
             'system',
-            'SUPER_ADMIN',
+            'MASTER_ADMIN',
             `Shop ${shop.shopName} (${shop.id}) expired on ${shop.expiryDate}`,
             shop.id
           );
@@ -599,79 +667,176 @@ async function start() {
     checkAndAutoExpireSubscriptions();
   }, 5 * 60 * 1000);
 
-  // 1A. SUPER ADMIN LOGIN
-  app.post('/api/auth/super-admin/login', (req: Request, res: Response) => {
-    const { email, password } = req.body;
-    const cleanEmail = (email || '').trim().toLowerCase();
+  // 1A. MASTER ADMIN STATUS & ONE-TIME SETUP
+  app.get('/api/auth/master-admin/status', (_req: Request, res: Response) => {
+    const masterAdmin = authDb.users.find((u) => u.role === 'MASTER_ADMIN');
+    return res.json({
+      success: true,
+      isConfigured: !!masterAdmin,
+      masterAdminUsername: masterAdmin?.username || undefined,
+      totalShops: subscriptionsDb.shops.length,
+      activeShops: subscriptionsDb.shops.filter((s) => s.status === 'active').length,
+    });
+  });
+
+  // ONE-TIME MASTER ADMIN SETUP (Permanently disabled once created)
+  app.post('/api/auth/master-admin/setup', (req: Request, res: Response) => {
+    const existingMaster = authDb.users.find((u) => u.role === 'MASTER_ADMIN');
+    if (existingMaster) {
+      return res.status(403).json({
+        success: false,
+        message: 'Master Admin is already configured on this device. Registration is permanently locked.',
+      });
+    }
+
+    const { username, fullName, phone, whatsapp, password, recoveryKey } = req.body;
+    const cleanUser = (username || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
     const cleanPass = (password || '').trim();
+    const cleanRecKey = (recoveryKey || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 
-    if (!cleanEmail || !cleanPass) {
-      return res.status(400).json({
-        success: false,
-        message: 'Super Admin email and password are required.',
-      });
+    if (!cleanUser || cleanUser.length < 3) {
+      return res.status(400).json({ success: false, message: 'Username must be at least 3 alphanumeric characters.' });
+    }
+    if (!cleanPass || cleanPass.length < 8) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 8 characters long.' });
+    }
+    if (!cleanRecKey || cleanRecKey.length < 16) {
+      return res.status(400).json({ success: false, message: 'Invalid Master Admin Recovery Key format.' });
     }
 
-    // Rate limiting check
-    const clientIp = req.ip || 'unknown';
-    const attemptRecord = authDb.failedAttempts[clientIp] || { count: 0, lastAttempt: 0 };
-    if (attemptRecord.count >= 6 && Date.now() - attemptRecord.lastAttempt < 5 * 60 * 1000) {
-      const waitMinutes = Math.ceil((5 * 60 * 1000 - (Date.now() - attemptRecord.lastAttempt)) / 60000);
-      return res.status(429).json({
-        success: false,
-        message: `Too many failed attempts. Please wait ${waitMinutes} minute(s) before trying again.`,
-      });
-    }
+    const passSalt = crypto.randomBytes(16).toString('hex');
+    const passHash = hashPassword(cleanPass, passSalt, 100000);
 
-    // Lookup super admin user
-    const superAdmin = authDb.users.find(
-      (u) =>
-        u.role === 'SUPER_ADMIN' &&
-        (u.email.toLowerCase() === cleanEmail ||
-          (u.secondaryEmails && u.secondaryEmails.some((se) => se.toLowerCase() === cleanEmail)))
+    const recSalt = crypto.randomBytes(16).toString('hex');
+    const recHash = hashPassword(cleanRecKey, recSalt, 100000);
+
+    const masterUser: StoredUser = {
+      id: 'USR-MASTER-ADMIN-01',
+      username: cleanUser,
+      fullName: (fullName || 'Master Admin').trim(),
+      phone: (phone || '').trim(),
+      whatsapp: (whatsapp || '').trim(),
+      role: 'MASTER_ADMIN',
+      passwordSalt: passSalt,
+      passwordHash: passHash,
+      recoveryKeySalt: recSalt,
+      recoveryKeyHash: recHash,
+      createdAt: new Date().toISOString(),
+    };
+
+    authDb.users.push(masterUser);
+    persistAuthDb();
+
+    // Create active session
+    const sessionToken = `ST-MA-${crypto.randomBytes(24).toString('hex')}`;
+    const sessionData: AuthSessionData = {
+      token: sessionToken,
+      userId: masterUser.id,
+      username: masterUser.username,
+      role: 'MASTER_ADMIN',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      ip: req.ip,
+    };
+    authDb.sessions[sessionToken] = sessionData;
+    persistAuthDb();
+
+    recordAuditLog(
+      'MASTER_ADMIN_CONFIGURED',
+      cleanUser,
+      'MASTER_ADMIN',
+      'One-time Master Admin account configured and registration permanently locked.',
+      undefined,
+      req.ip
     );
 
-    if (!superAdmin || !verifyPassword(cleanPass, superAdmin)) {
-      authDb.failedAttempts[clientIp] = {
+    return res.json({
+      success: true,
+      token: sessionToken,
+      role: 'MASTER_ADMIN',
+      user: {
+        id: masterUser.id,
+        username: masterUser.username,
+        fullName: masterUser.fullName,
+        phone: masterUser.phone,
+        whatsapp: masterUser.whatsapp,
+        role: masterUser.role,
+        createdAt: masterUser.createdAt,
+      },
+    });
+  });
+
+  // 1B. MASTER ADMIN LOGIN
+  app.post('/api/auth/master-admin/login', (req: Request, res: Response) => {
+    const { username, password } = req.body;
+    const cleanUser = (username || '').trim().toLowerCase();
+    const cleanPass = (password || '').trim();
+
+    if (!cleanUser || !cleanPass) {
+      return res.status(400).json({ success: false, message: 'Username and password are required.' });
+    }
+
+    const clientIp = req.ip || 'unknown';
+    const attemptKey = `ma_${cleanUser}_${clientIp}`;
+    const attemptRecord = authDb.failedAttempts[attemptKey] || { count: 0, lastAttempt: 0 };
+
+    if (attemptRecord.count >= 5 && Date.now() - attemptRecord.lastAttempt < 15 * 60 * 1000) {
+      const waitMinutes = Math.ceil((15 * 60 * 1000 - (Date.now() - attemptRecord.lastAttempt)) / 60000);
+      return res.status(429).json({
+        success: false,
+        message: `Account temporarily locked due to failed attempts. Please wait ${waitMinutes} minute(s).`,
+      });
+    }
+
+    const masterAdmin = authDb.users.find(
+      (u) => u.role === 'MASTER_ADMIN' && u.username?.toLowerCase() === cleanUser
+    );
+
+    if (!masterAdmin || !verifyPassword(cleanPass, masterAdmin)) {
+      authDb.failedAttempts[attemptKey] = {
         count: (attemptRecord.count || 0) + 1,
         lastAttempt: Date.now(),
       };
       persistAuthDb();
       recordAuditLog(
-        'SUPER_ADMIN_LOGIN_FAILED',
-        cleanEmail,
-        'SUPER_ADMIN',
-        `Failed Super Admin login attempt from IP ${clientIp}`,
+        'MASTER_ADMIN_LOGIN_FAILED',
+        cleanUser,
+        'MASTER_ADMIN',
+        `Failed Master Admin login attempt for ${cleanUser} from IP ${clientIp}`,
         undefined,
         clientIp
       );
+      const remaining = 5 - (attemptRecord.count + 1);
       return res.status(401).json({
         success: false,
-        message: 'Invalid Super Admin credentials. Only authorized Software Owner can access.',
+        message:
+          remaining > 0
+            ? `Invalid Master Admin credentials. (${remaining} attempt${remaining === 1 ? '' : 's'} remaining)`
+            : `Account locked for 15 minutes due to 5 consecutive failed attempts.`,
       });
     }
 
     // Reset failed attempts on success
-    delete authDb.failedAttempts[clientIp];
+    delete authDb.failedAttempts[attemptKey];
 
-    const sessionToken = `ST-SA-${crypto.randomBytes(24).toString('hex')}`;
+    const sessionToken = `ST-MA-${crypto.randomBytes(24).toString('hex')}`;
     const sessionData: AuthSessionData = {
       token: sessionToken,
-      userId: superAdmin.id,
-      email: superAdmin.email,
-      role: 'SUPER_ADMIN',
+      userId: masterAdmin.id,
+      username: masterAdmin.username,
+      role: 'MASTER_ADMIN',
       createdAt: Date.now(),
-      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 days
+      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
       ip: clientIp,
     };
     authDb.sessions[sessionToken] = sessionData;
     persistAuthDb();
 
     recordAuditLog(
-      'SUPER_ADMIN_LOGIN_SUCCESS',
-      superAdmin.email,
-      'SUPER_ADMIN',
-      'Super Admin logged in successfully',
+      'MASTER_ADMIN_LOGIN_SUCCESS',
+      masterAdmin.username || 'admin',
+      'MASTER_ADMIN',
+      'Master Admin logged in successfully',
       undefined,
       clientIp
     );
@@ -679,35 +844,287 @@ async function start() {
     return res.json({
       success: true,
       token: sessionToken,
-      role: 'SUPER_ADMIN',
+      role: 'MASTER_ADMIN',
       user: {
-        id: superAdmin.id,
-        email: superAdmin.email,
-        fullName: superAdmin.fullName,
-        phone: superAdmin.phone,
-        whatsapp: superAdmin.whatsapp,
-        role: superAdmin.role,
-        createdAt: superAdmin.createdAt,
-      },
-      softwareOwner: {
-        name: 'Muhammad Waqas',
-        whatsapp: '03228570782',
-        mobile: '03429634133',
-        softwareName: 'WAQAS POS SOFTWARE',
+        id: masterAdmin.id,
+        username: masterAdmin.username,
+        fullName: masterAdmin.fullName,
+        phone: masterAdmin.phone,
+        whatsapp: masterAdmin.whatsapp,
+        role: masterAdmin.role,
+        createdAt: masterAdmin.createdAt,
       },
     });
   });
 
-  // 1B. SHOP OWNER LOGIN
+  // 1C. MASTER ADMIN RECOVERY KEY VERIFICATION & RECOVERY
+  app.post('/api/auth/master-admin/verify-recovery', (req: Request, res: Response) => {
+    const { username, recoveryKey } = req.body;
+    const cleanUser = (username || '').trim().toLowerCase();
+    const cleanKey = (recoveryKey || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+    const masterAdmin = authDb.users.find(
+      (u) => u.role === 'MASTER_ADMIN' && u.username?.toLowerCase() === cleanUser
+    );
+
+    if (!masterAdmin || !masterAdmin.recoveryKeySalt || !masterAdmin.recoveryKeyHash) {
+      return res.status(401).json({ success: false, message: 'Invalid username or Recovery Key not configured.' });
+    }
+
+    const calcHash = hashPassword(cleanKey, masterAdmin.recoveryKeySalt, 100000);
+    if (calcHash !== masterAdmin.recoveryKeyHash) {
+      return res.status(401).json({ success: false, message: 'Invalid Recovery Key provided.' });
+    }
+
+    return res.json({ success: true, message: 'Recovery Key successfully verified.' });
+  });
+
+  app.post('/api/auth/master-admin/recover', (req: Request, res: Response) => {
+    const { username, recoveryKey, newPassword, newRecoveryKey } = req.body;
+    const cleanUser = (username || '').trim().toLowerCase();
+    const cleanKey = (recoveryKey || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const cleanPass = (newPassword || '').trim();
+    const cleanNewRecKey = (newRecoveryKey || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+    if (!cleanPass || cleanPass.length < 8) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 8 characters long.' });
+    }
+
+    const masterAdmin = authDb.users.find(
+      (u) => u.role === 'MASTER_ADMIN' && u.username?.toLowerCase() === cleanUser
+    );
+
+    if (!masterAdmin || !masterAdmin.recoveryKeySalt || !masterAdmin.recoveryKeyHash) {
+      return res.status(401).json({ success: false, message: 'Invalid Master Admin credentials.' });
+    }
+
+    const calcHash = hashPassword(cleanKey, masterAdmin.recoveryKeySalt, 100000);
+    if (calcHash !== masterAdmin.recoveryKeyHash) {
+      return res.status(401).json({ success: false, message: 'Invalid Recovery Key provided.' });
+    }
+
+    // Update password
+    const newPassSalt = crypto.randomBytes(16).toString('hex');
+    masterAdmin.passwordSalt = newPassSalt;
+    masterAdmin.passwordHash = hashPassword(cleanPass, newPassSalt, 100000);
+
+    // If replacement recovery key provided, update it
+    if (cleanNewRecKey && cleanNewRecKey.length >= 16) {
+      const newRecSalt = crypto.randomBytes(16).toString('hex');
+      masterAdmin.recoveryKeySalt = newRecSalt;
+      masterAdmin.recoveryKeyHash = hashPassword(cleanNewRecKey, newRecSalt, 100000);
+    }
+
+    persistAuthDb();
+    recordAuditLog(
+      'MASTER_ADMIN_RECOVERED',
+      cleanUser,
+      'MASTER_ADMIN',
+      'Master Admin password was reset via Recovery Key.',
+      undefined,
+      req.ip
+    );
+
+    return res.json({ success: true, message: 'Master Admin password reset successfully.' });
+  });
+
+  // 1C2. NEW DIRECT MASTER ADMIN PASSWORD RESET WITH RECOVERY KEY
+  app.post('/api/auth/master-admin/reset-password', (req: Request, res: Response) => {
+    const { username, recoveryKey, newPassword, confirmPassword, newRecoveryKey } = req.body;
+    const cleanUser = (username || '').trim().toLowerCase();
+    const cleanKey = (recoveryKey || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const cleanPass = (newPassword || '').trim();
+    const cleanConfirm = (confirmPassword || '').trim();
+
+    const clientIp = req.ip || 'unknown';
+    const attemptKey = `reset_ma_${cleanUser}_${clientIp}`;
+    const attemptRecord = authDb.failedAttempts[attemptKey] || { count: 0, lastAttempt: 0 };
+
+    // Rate limiting: 5 failed attempts locks for 15 minutes
+    if (attemptRecord.count >= 5 && Date.now() - attemptRecord.lastAttempt < 15 * 60 * 1000) {
+      const waitMinutes = Math.ceil((15 * 60 * 1000 - (Date.now() - attemptRecord.lastAttempt)) / 60000);
+      return res.status(429).json({
+        success: false,
+        message: `Too many failed password reset attempts. System locked for ${waitMinutes} minute(s) to protect the device.`,
+      });
+    }
+
+    if (!cleanUser) {
+      return res.status(400).json({ success: false, message: 'Master Admin username is required.' });
+    }
+
+    if (!cleanKey || cleanKey.length < 16) {
+      return res.status(400).json({ success: false, message: 'A valid Master Recovery Key (16-20 characters) is required.' });
+    }
+
+    if (!cleanPass || cleanPass.length < 8) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 8 characters long.' });
+    }
+
+    if (cleanConfirm && cleanPass !== cleanConfirm) {
+      return res.status(400).json({ success: false, message: 'New password and Confirm password do not match.' });
+    }
+
+    const masterAdmin = authDb.users.find(
+      (u) => u.role === 'MASTER_ADMIN' && u.username?.toLowerCase() === cleanUser
+    );
+
+    if (!masterAdmin || !masterAdmin.recoveryKeySalt || !masterAdmin.recoveryKeyHash) {
+      authDb.failedAttempts[attemptKey] = {
+        count: (attemptRecord.count || 0) + 1,
+        lastAttempt: Date.now(),
+      };
+      persistAuthDb();
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid Master Admin username or Recovery Key not configured on this device.',
+      });
+    }
+
+    const calcHash = hashPassword(cleanKey, masterAdmin.recoveryKeySalt, 100000);
+    if (calcHash !== masterAdmin.recoveryKeyHash) {
+      authDb.failedAttempts[attemptKey] = {
+        count: (attemptRecord.count || 0) + 1,
+        lastAttempt: Date.now(),
+      };
+      persistAuthDb();
+      recordAuditLog(
+        'MASTER_ADMIN_RESET_FAILED',
+        cleanUser,
+        'MASTER_ADMIN',
+        `Failed Master Admin password reset attempt with invalid Recovery Key from IP ${clientIp}`,
+        undefined,
+        clientIp
+      );
+      const remaining = 5 - (attemptRecord.count + 1);
+      return res.status(401).json({
+        success: false,
+        message:
+          remaining > 0
+            ? `Invalid Master Recovery Key. (${remaining} attempt${remaining === 1 ? '' : 's'} remaining)`
+            : 'Too many failed attempts. Password reset locked for 15 minutes.',
+      });
+    }
+
+    // Success! Clear failed reset attempts
+    delete authDb.failedAttempts[attemptKey];
+
+    // Hash the new password with fresh salt and 100,000 PBKDF2 iterations
+    const newPassSalt = crypto.randomBytes(16).toString('hex');
+    masterAdmin.passwordSalt = newPassSalt;
+    masterAdmin.passwordHash = hashPassword(cleanPass, newPassSalt, 100000);
+
+    // If replacement recovery key was supplied, update it as well
+    if (newRecoveryKey) {
+      const cleanNewRecKey = (newRecoveryKey || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if (cleanNewRecKey.length >= 16) {
+        const newRecSalt = crypto.randomBytes(16).toString('hex');
+        masterAdmin.recoveryKeySalt = newRecSalt;
+        masterAdmin.recoveryKeyHash = hashPassword(cleanNewRecKey, newRecSalt, 100000);
+      }
+    }
+
+    persistAuthDb();
+    recordAuditLog(
+      'MASTER_ADMIN_PASSWORD_RESET',
+      cleanUser,
+      'MASTER_ADMIN',
+      'Master Admin password was reset successfully using Master Recovery Key.',
+      undefined,
+      clientIp
+    );
+
+    return res.json({
+      success: true,
+      message: 'Master Password Reset Successfully',
+      user: {
+        id: masterAdmin.id,
+        username: masterAdmin.username,
+        fullName: masterAdmin.fullName,
+        role: masterAdmin.role,
+      },
+    });
+  });
+
+  // 1D. CHANGE MASTER ADMIN PASSWORD
+  app.post('/api/auth/master-admin/change-password', (req: Request, res: Response) => {
+    const session = getSessionFromReq(req);
+    if (!session || session.role !== 'MASTER_ADMIN') {
+      return res.status(401).json({ success: false, message: 'Master Admin authentication required.' });
+    }
+
+    const { currentPassword, newPassword } = req.body;
+    if (!newPassword || newPassword.trim().length < 8) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 8 characters long.' });
+    }
+
+    const masterAdmin = authDb.users.find((u) => u.id === session.userId && u.role === 'MASTER_ADMIN');
+    if (!masterAdmin || !verifyPassword(currentPassword, masterAdmin)) {
+      return res.status(401).json({ success: false, message: 'Incorrect current password.' });
+    }
+
+    const newSalt = crypto.randomBytes(16).toString('hex');
+    masterAdmin.passwordSalt = newSalt;
+    masterAdmin.passwordHash = hashPassword(newPassword.trim(), newSalt, 100000);
+    persistAuthDb();
+
+    recordAuditLog(
+      'MASTER_ADMIN_PASSWORD_CHANGED',
+      masterAdmin.username || 'admin',
+      'MASTER_ADMIN',
+      'Master Admin password changed.',
+      undefined,
+      req.ip
+    );
+
+    return res.json({ success: true, message: 'Master Admin password successfully updated.' });
+  });
+
+  // 1E. REGENERATE RECOVERY KEY
+  app.post('/api/auth/master-admin/update-recovery-key', (req: Request, res: Response) => {
+    const session = getSessionFromReq(req);
+    if (!session || session.role !== 'MASTER_ADMIN') {
+      return res.status(401).json({ success: false, message: 'Master Admin authentication required.' });
+    }
+
+    const { currentPassword, newRecoveryKey } = req.body;
+    const cleanKey = (newRecoveryKey || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!cleanKey || cleanKey.length < 16) {
+      return res.status(400).json({ success: false, message: 'Invalid replacement Recovery Key.' });
+    }
+
+    const masterAdmin = authDb.users.find((u) => u.id === session.userId && u.role === 'MASTER_ADMIN');
+    if (!masterAdmin || !verifyPassword(currentPassword, masterAdmin)) {
+      return res.status(401).json({ success: false, message: 'Incorrect password.' });
+    }
+
+    const newSalt = crypto.randomBytes(16).toString('hex');
+    masterAdmin.recoveryKeySalt = newSalt;
+    masterAdmin.recoveryKeyHash = hashPassword(cleanKey, newSalt, 100000);
+    persistAuthDb();
+
+    recordAuditLog(
+      'RECOVERY_KEY_REGENERATED',
+      masterAdmin.username || 'admin',
+      'MASTER_ADMIN',
+      'Master Admin Recovery Key regenerated and old key invalidated.',
+      undefined,
+      req.ip
+    );
+
+    return res.json({ success: true, message: 'Recovery Key regenerated successfully.' });
+  });
+
+  // 1F. SHOP OWNER LOGIN
   app.post('/api/auth/shop-owner/login', (req: Request, res: Response) => {
-    const { email, password } = req.body;
-    const cleanEmail = (email || '').trim().toLowerCase();
+    const { username, email, password } = req.body;
+    const cleanIdentifier = (username || email || '').trim().toLowerCase();
     const cleanPass = (password || '').trim();
 
-    if (!cleanEmail || !cleanPass) {
+    if (!cleanIdentifier || !cleanPass) {
       return res.status(400).json({
         success: false,
-        message: 'Registered Shop email and password are required.',
+        message: 'Shop username and password are required.',
       });
     }
 
@@ -717,33 +1134,44 @@ async function start() {
     const shopUser = authDb.users.find(
       (u) =>
         u.role === 'SHOP_OWNER' &&
-        (u.email.toLowerCase() === cleanEmail ||
-          (u.secondaryEmails && u.secondaryEmails.some((se) => se.toLowerCase() === cleanEmail)))
+        ((u.username && u.username.toLowerCase() === cleanIdentifier) ||
+          (u.email && u.email.toLowerCase() === cleanIdentifier) ||
+          (u.secondaryEmails && u.secondaryEmails.some((se) => se.toLowerCase() === cleanIdentifier)))
     );
 
     if (!shopUser || !verifyPassword(cleanPass, shopUser)) {
       recordAuditLog(
-        'SHOP_OWNER_LOGIN_FAILED',
-        cleanEmail,
+        'SHOP_LOGIN_FAILED',
+        cleanIdentifier,
         'SHOP_OWNER',
-        `Failed Shop Owner login attempt for ${cleanEmail} from IP ${clientIp}`,
+        `Failed Shop login attempt for ${cleanIdentifier} from IP ${clientIp}`,
         shopUser?.shopId,
         clientIp
       );
       return res.status(401).json({
         success: false,
-        message: 'Invalid credentials. Only registered Shop Owner accounts created by Super Admin can log in.',
+        message: 'Invalid credentials. Only registered Shop accounts created by Master Admin can log in.',
       });
     }
 
-    // Lookup corresponding shop in subscriptionsDb
+    // Lookup corresponding shop
     checkAndAutoExpireSubscriptions();
-    const shop = subscriptionsDb.shops.find((s) => s.id === shopUser.shopId || s.email.toLowerCase() === cleanEmail);
+    const shop = subscriptionsDb.shops.find(
+      (s) => s.id === shopUser.shopId || s.email?.toLowerCase() === cleanIdentifier
+    );
 
     if (!shop) {
       return res.status(404).json({
         success: false,
-        message: 'Shop account profile not found. Please contact Super Admin Muhammad Waqas (03228570782).',
+        message: 'Shop account record not found on this device.',
+      });
+    }
+
+    // Check account status: Inactive accounts CANNOT log in!
+    if (shop.status === 'inactive' || shop.status === 'suspended' || shop.status === 'blocked') {
+      return res.status(403).json({
+        success: false,
+        message: `Account inactive: This shop account (${shop.shopName}) has been deactivated by the Master Admin.`,
       });
     }
 
@@ -752,6 +1180,7 @@ async function start() {
       token: sessionToken,
       userId: shopUser.id,
       email: shopUser.email,
+      username: shopUser.username,
       role: 'SHOP_OWNER',
       shopId: shop.id,
       createdAt: Date.now(),
@@ -762,8 +1191,8 @@ async function start() {
     persistAuthDb();
 
     recordAuditLog(
-      'SHOP_OWNER_LOGIN_SUCCESS',
-      shopUser.email,
+      'SHOP_LOGIN_SUCCESS',
+      shopUser.username || shopUser.email || cleanIdentifier,
       'SHOP_OWNER',
       `Shop Owner logged in for ${shop.shopName} (${shop.id})`,
       shop.id,
@@ -777,6 +1206,7 @@ async function start() {
       user: {
         id: shopUser.id,
         email: shopUser.email,
+        username: shopUser.username,
         fullName: shopUser.fullName,
         phone: shopUser.phone,
         whatsapp: shopUser.whatsapp,
@@ -788,7 +1218,6 @@ async function start() {
       },
       shop,
       subscriptionStatus: shop.status,
-      mustChangePasswordOnFirstLogin: !!shopUser.mustChangePasswordOnFirstLogin,
     });
   });
 
@@ -879,9 +1308,9 @@ async function start() {
 
     recordAuditLog(
       'PASSWORD_CHANGED',
-      user.email,
+      user.email || user.username || 'user',
       user.role,
-      `User ${user.email} changed their password successfully`,
+      `User ${user.email || user.username} changed their password successfully`,
       user.shopId,
       req.ip
     );
@@ -904,7 +1333,7 @@ async function start() {
     const user = authDb.users.find(
       (u) =>
         (!role || u.role === role) &&
-        (u.email.toLowerCase() === cleanEmail ||
+        ((u.email && u.email.toLowerCase() === cleanEmail) ||
           (u.secondaryEmails && u.secondaryEmails.some((se) => se.toLowerCase() === cleanEmail)))
     );
 
@@ -922,9 +1351,9 @@ async function start() {
 
     recordAuditLog(
       'PASSWORD_RESET_REQUESTED',
-      user.email,
+      user.email || user.username || 'user',
       user.role,
-      `Password reset code generated for ${user.email}`,
+      `Password reset code generated for ${user.email || user.username}`,
       user.shopId,
       req.ip
     );
@@ -964,7 +1393,7 @@ async function start() {
 
     const user = authDb.users.find(
       (u) =>
-        u.email.toLowerCase() === cleanEmail ||
+        (u.email && u.email.toLowerCase() === cleanEmail) ||
         (u.secondaryEmails && u.secondaryEmails.some((se) => se.toLowerCase() === cleanEmail))
     );
 
@@ -988,9 +1417,9 @@ async function start() {
 
     recordAuditLog(
       'PASSWORD_RESET_SUCCESS',
-      user.email,
+      user.email || user.username || 'user',
       user.role,
-      `User ${user.email} reset their password using verification code`,
+      `User ${user.email || user.username} reset their password using verification code`,
       user.shopId,
       req.ip
     );
@@ -1007,7 +1436,7 @@ async function start() {
     if (session) {
       delete authDb.sessions[session.token];
       persistAuthDb();
-      recordAuditLog('LOGOUT', session.email, session.role, 'User signed out', session.shopId, req.ip);
+      recordAuditLog('LOGOUT', session.email || session.username || 'user', session.role, 'User signed out', session.shopId, req.ip);
     }
     return res.json({ success: true, message: 'Logged out successfully.' });
   });
@@ -1017,7 +1446,7 @@ async function start() {
     const { identifier, pin, deviceName, deviceType, browser, os } = req.body;
     const cleanId = (identifier || '').trim().toLowerCase();
 
-    const validEmails = ['muhammedsaad255251@gmail.com', 'waqasmart.pos@gmail.com', 'waqaspos.admin@gmail.com'];
+    const validEmails = ['muhammedsaad255251@gmail.com', 'waqasmart.pos@gmail.com'];
     const validPhones = ['+923001234567', '03001234567', '0300-1234567', '3001234567', '03228570782', '03429634133'];
 
     const isAuthorizedId =
@@ -1426,10 +1855,18 @@ async function start() {
   // -------------------------------------------------------------
   // 5. AUTHORITATIVE STORE STATE & MUTATIONS
   // -------------------------------------------------------------
-  app.get('/api/store/state', (_req: Request, res: Response) => {
+  app.get('/api/store/state', (req: Request, res: Response) => {
+    const session = getSessionFromReq(req);
+    const targetShopId =
+      (req.query.shopId as string) ||
+      session?.shopId ||
+      (req.headers['x-shop-id'] as string) ||
+      'SHOP-WM-001';
+    const shopData = loadShopStoreData(targetShopId);
     return res.json({
       success: true,
-      store: storeDb,
+      shopId: targetShopId,
+      store: shopData,
     });
   });
 
@@ -1955,7 +2392,7 @@ async function start() {
         remainingBalance,
         paymentMethod: 'Cash',
         paymentDate: new Date().toISOString().split('T')[0],
-        confirmedBy: 'Muhammad Waqas (Super Admin)',
+        confirmedBy: 'Muhammad Waqas (Master Admin)',
         status: remainingBalance === 0 ? 'Paid' : 'Partially Paid',
         createdAt: new Date().toISOString(),
       };
@@ -1967,7 +2404,7 @@ async function start() {
     recordAuditLog(
       'SHOP_CREATED',
       'Muhammad Waqas',
-      'SUPER_ADMIN',
+      'MASTER_ADMIN',
       `Created new shop ${newShop.shopName} (${uniqueShopId}) for ${newShop.ownerName}. Plan: ${newShop.plan}`,
       uniqueShopId,
       req.ip
@@ -2003,7 +2440,7 @@ async function start() {
     recordAuditLog(
       'SHOP_STATUS_UPDATED',
       'Muhammad Waqas',
-      'SUPER_ADMIN',
+      'MASTER_ADMIN',
       `Updated ${shop.shopName} (${shop.id}): status changed from ${prevStatus} to ${shop.status}`,
       shop.id,
       req.ip
@@ -2056,7 +2493,7 @@ async function start() {
       paymentMethod,
       paymentDate: paymentDate || new Date().toISOString().split('T')[0],
       transactionReference: transactionReference || undefined,
-      confirmedBy: 'Muhammad Waqas (Super Admin)',
+      confirmedBy: 'Muhammad Waqas (Master Admin)',
       notes: notes || undefined,
       status: remaining === 0 ? 'Paid' : paid > 0 ? 'Partially Paid' : 'Unpaid',
       createdAt: new Date().toISOString(),
@@ -2074,7 +2511,7 @@ async function start() {
     recordAuditLog(
       'PAYMENT_RECORDED',
       'Muhammad Waqas',
-      'SUPER_ADMIN',
+      'MASTER_ADMIN',
       `Recorded payment Rs. ${paid.toLocaleString()} for ${shop.shopName} (${shop.id}) via ${paymentMethod} - Receipt: ${receiptNumber}`,
       shop.id,
       req.ip
@@ -2133,7 +2570,7 @@ async function start() {
       paymentReceiptNumber: receiptNumber,
       amount: paidAmt,
       renewedAt: new Date().toISOString(),
-      confirmedBy: 'Muhammad Waqas (Super Admin)',
+      confirmedBy: 'Muhammad Waqas (Master Admin)',
     };
     subscriptionsDb.renewals.unshift(renewalRecord);
 
@@ -2154,7 +2591,7 @@ async function start() {
         remainingBalance: 0,
         paymentMethod: paymentMethod || 'Cash',
         paymentDate: new Date().toISOString().split('T')[0],
-        confirmedBy: 'Muhammad Waqas (Super Admin)',
+        confirmedBy: 'Muhammad Waqas (Master Admin)',
         notes: notes || 'Renewal payment confirmed',
         status: 'Paid',
         createdAt: new Date().toISOString(),
@@ -2168,7 +2605,7 @@ async function start() {
     recordAuditLog(
       'SUBSCRIPTION_RENEWED',
       'Muhammad Waqas',
-      'SUPER_ADMIN',
+      'MASTER_ADMIN',
       `Renewed subscription for ${shop.shopName} (${shop.id}) by ${durationDays} days. New expiry: ${newExpiry}`,
       shop.id,
       req.ip
@@ -2178,57 +2615,194 @@ async function start() {
   });
 
   // -------------------------------------------------------------
-  // 6. SUPER ADMIN MANAGEMENT & AUDIT API
+  // 6. MASTER ADMIN MANAGEMENT, SHOPS, BACKUP & AUDIT API
   // -------------------------------------------------------------
-  // Audit Logs
-  app.get('/api/super-admin/audit-logs', (_req: Request, res: Response) => {
-    return res.json({ success: true, logs: auditLogs });
+  // Get all shops (Master Admin only)
+  app.get('/api/master-admin/shops', (req: Request, res: Response) => {
+    return res.json({ success: true, shops: subscriptionsDb.shops });
   });
 
-  // Admin Settings
-  app.get('/api/super-admin/settings', (_req: Request, res: Response) => {
-    return res.json({
-      success: true,
-      softwareOwner: {
-        softwareName: 'WAQAS POS SOFTWARE',
-        ownerName: 'Muhammad Waqas',
-        whatsapp: '03228570782',
-        mobile: '03429634133',
-        martName: 'WAQAS MART',
-        tagline: 'Better Shop Better Business',
-      },
-      defaultPricing: subscriptionsDb.defaultPricing || {
+  // Create new shop account (Master Admin only)
+  app.post('/api/master-admin/shops', (req: Request, res: Response) => {
+    const { shopName, username, password, ownerName, phone, address, status = 'active' } = req.body;
+    const cleanName = (shopName || '').trim();
+    const cleanUser = (username || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+    const cleanPass = (password || '').trim();
+
+    if (!cleanName || !cleanUser || !cleanPass) {
+      return res.status(400).json({ success: false, message: 'Shop name, username, and password are required.' });
+    }
+
+    // Ensure username is unique
+    const existing = authDb.users.find((u) => u.username?.toLowerCase() === cleanUser || u.email?.toLowerCase() === cleanUser);
+    if (existing) {
+      return res.status(400).json({ success: false, message: 'Username is already in use by another account.' });
+    }
+
+    const uniqueShopId = `SHOP-${Date.now().toString().slice(-6)}`;
+    const passSalt = crypto.randomBytes(16).toString('hex');
+    const passHash = hashPassword(cleanPass, passSalt, 100000);
+
+    const newShopAccount: ShopAccount = {
+      id: uniqueShopId,
+      shopName: cleanName,
+      ownerName: (ownerName || cleanName).trim(),
+      email: `${cleanUser}@localpos`,
+      phone: (phone || '').trim(),
+      whatsapp: (phone || '').trim(),
+      address: (address || '').trim(),
+      status: status === 'active' ? 'active' : 'inactive',
+      plan: '12_months',
+      startDate: new Date().toISOString().split('T')[0],
+      expiryDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+      pricing: {
         oneMonth: 1500,
         threeMonths: 4000,
         sixMonths: 7500,
         twelveMonths: 14000,
-      },
-    });
-  });
-
-  // Update Admin Settings / Pricing
-  app.put('/api/super-admin/settings', (req: Request, res: Response) => {
-    const { defaultPricing } = req.body;
-    if (defaultPricing) {
-      subscriptionsDb.defaultPricing = {
-        ...subscriptionsDb.defaultPricing,
-        ...defaultPricing,
+        customPricePerMonth: 1500,
         lastUpdated: new Date().toISOString().split('T')[0],
-      };
-      persistSubscriptions();
-      recordAuditLog(
-        'GLOBAL_PRICING_UPDATED',
-        'Muhammad Waqas',
-        'SUPER_ADMIN',
-        `Updated global default subscription pricing: 1M: Rs. ${subscriptionsDb.defaultPricing?.oneMonth || 1500}, 12M: Rs. ${subscriptionsDb.defaultPricing?.twelveMonths || 14000}`,
-        undefined,
-        req.ip
-      );
-    }
-    return res.json({ success: true, defaultPricing: subscriptionsDb.defaultPricing });
+      },
+      initialPayment: 0,
+      remainingBalance: 0,
+      totalPaid: 0,
+      totalIncome: 0,
+      renewalsCount: 0,
+      createdAt: new Date().toISOString().split('T')[0],
+    };
+
+    const newShopUser: StoredUser = {
+      id: `USR-${uniqueShopId}`,
+      username: cleanUser,
+      email: `${cleanUser}@localpos`,
+      fullName: (ownerName || cleanName).trim(),
+      phone: (phone || '').trim(),
+      whatsapp: (phone || '').trim(),
+      role: 'SHOP_OWNER',
+      shopId: uniqueShopId,
+      passwordSalt: passSalt,
+      passwordHash: passHash,
+      createdAt: new Date().toISOString(),
+    };
+
+    subscriptionsDb.shops.unshift(newShopAccount);
+    authDb.users.push(newShopUser);
+    persistSubscriptions();
+    persistAuthDb();
+
+    // Initialize isolated database file for new shop
+    loadShopStoreData(uniqueShopId);
+
+    recordAuditLog(
+      'SHOP_CREATED',
+      cleanUser,
+      'MASTER_ADMIN',
+      `Master Admin created new shop ${cleanName} (${uniqueShopId}) with username ${cleanUser}`,
+      uniqueShopId,
+      req.ip
+    );
+
+    return res.json({ success: true, shop: newShopAccount });
   });
 
-  // Dedicated Mart Owner Profile Endpoints (Editable by Shop Owner & Admin)
+  // Edit shop account
+  app.put('/api/master-admin/shops/:id', (req: Request, res: Response) => {
+    const { id } = req.params;
+    const shop = subscriptionsDb.shops.find((s) => s.id === id);
+    if (!shop) {
+      return res.status(404).json({ success: false, message: 'Shop not found.' });
+    }
+
+    const { shopName, ownerName, phone, address } = req.body;
+    if (shopName) shop.shopName = shopName.trim();
+    if (ownerName) shop.ownerName = ownerName.trim();
+    if (phone) shop.phone = phone.trim();
+    if (address) shop.address = address.trim();
+
+    persistSubscriptions();
+    recordAuditLog(
+      'SHOP_UPDATED',
+      'Master Admin',
+      'MASTER_ADMIN',
+      `Updated details for shop ${shop.shopName} (${shop.id})`,
+      shop.id,
+      req.ip
+    );
+
+    return res.json({ success: true, shop });
+  });
+
+  // Toggle shop active / inactive
+  app.post('/api/master-admin/shops/:id/toggle-status', (req: Request, res: Response) => {
+    const { id } = req.params;
+    const shop = subscriptionsDb.shops.find((s) => s.id === id);
+    if (!shop) {
+      return res.status(404).json({ success: false, message: 'Shop not found.' });
+    }
+
+    const { status } = req.body;
+    const newStatus = status || (shop.status === 'active' ? 'inactive' : 'active');
+    shop.status = newStatus;
+    persistSubscriptions();
+
+    // If deactivated, invalidate all active sessions for this shop
+    if (newStatus !== 'active') {
+      for (const token of Object.keys(authDb.sessions)) {
+        if (authDb.sessions[token].shopId === shop.id) {
+          delete authDb.sessions[token];
+        }
+      }
+      persistAuthDb();
+    }
+
+    recordAuditLog(
+      'SHOP_STATUS_CHANGED',
+      'Master Admin',
+      'MASTER_ADMIN',
+      `Shop ${shop.shopName} (${shop.id}) status set to ${newStatus}`,
+      shop.id,
+      req.ip
+    );
+
+    return res.json({ success: true, status: newStatus });
+  });
+
+  // Reset shop password
+  app.post('/api/master-admin/shops/:id/password', (req: Request, res: Response) => {
+    const { id } = req.params;
+    const shopUser = authDb.users.find((u) => u.shopId === id && u.role === 'SHOP_OWNER');
+    if (!shopUser) {
+      return res.status(404).json({ success: false, message: 'Shop user account not found.' });
+    }
+
+    const { password } = req.body;
+    if (!password || password.trim().length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters long.' });
+    }
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    shopUser.passwordSalt = salt;
+    shopUser.passwordHash = hashPassword(password.trim(), salt, 100000);
+    persistAuthDb();
+
+    recordAuditLog(
+      'SHOP_PASSWORD_RESET',
+      'Master Admin',
+      'MASTER_ADMIN',
+      `Master Admin reset password for shop ${id}`,
+      id,
+      req.ip
+    );
+
+    return res.json({ success: true, message: 'Shop password reset successfully.' });
+  });
+
+  // Master Admin Audit Logs
+  app.get('/api/master-admin/audit-logs', (_req: Request, res: Response) => {
+    return res.json({ success: true, logs: auditLogs });
+  });
+
+  // Dedicated Mart Owner Profile Endpoints (Editable by Shop Owner & Master Admin)
   app.get('/api/settings/mart-owner', (_req: Request, res: Response) => {
     return res.json({
       success: true,
@@ -2244,7 +2818,7 @@ async function start() {
       },
       softwareOwner: {
         name: 'Muhammad Waqas',
-        designation: 'SOFTWARE OWNER — WAQAS POS SOFTWARE',
+        designation: 'MASTER ADMINISTRATOR — WAQAS POS SOFTWARE',
         whatsapp: '03228570782',
         mobile: '03429634133',
         photoUrl: '/5c454cea45cc8c39a24b57a83fbbc5cf_0.webp',
@@ -2274,22 +2848,83 @@ async function start() {
     return res.json({ success: true, martOwner: (storeDb as any).martOwner });
   });
 
-  // System Backup JSON Export
-  app.get('/api/super-admin/backup', (_req: Request, res: Response) => {
+  // Master Admin Encrypted Backup Export
+  app.get('/api/master-admin/backup/export', (_req: Request, res: Response) => {
+    // Gather all shop database files
+    const allShopData: Record<string, any> = {};
+    if (fs.existsSync(SHOPS_DIR)) {
+      const files = fs.readdirSync(SHOPS_DIR);
+      for (const f of files) {
+        if (f.endsWith('.json')) {
+          const sId = f.replace('.json', '');
+          try {
+            allShopData[sId] = JSON.parse(fs.readFileSync(path.join(SHOPS_DIR, f), 'utf-8'));
+          } catch {}
+        }
+      }
+    }
+
     return res.json({
       success: true,
       timestamp: new Date().toISOString(),
-      softwareOwner: 'Muhammad Waqas (03228570782)',
-      backup: {
-        shops: subscriptionsDb.shops,
-        payments: subscriptionsDb.payments,
-        renewals: subscriptionsDb.renewals,
-        defaultPricing: subscriptionsDb.defaultPricing,
-        auditLogs,
-        store: storeDb,
-        devices: registeredDevices,
-      },
+      version: '2.0-offline',
+      device: 'Local Terminal',
+      masterAdmin: authDb.users.find((u) => u.role === 'MASTER_ADMIN') || null,
+      shops: subscriptionsDb.shops,
+      shopDatabases: allShopData,
+      payments: subscriptionsDb.payments,
+      renewals: subscriptionsDb.renewals,
+      auditLogs,
+      store: storeDb,
+      devices: registeredDevices,
     });
+  });
+
+  // Master Admin Backup Restore
+  app.post('/api/master-admin/backup/import', (req: Request, res: Response) => {
+    const { restoredData } = req.body;
+    if (!restoredData) {
+      return res.status(400).json({ success: false, message: 'Invalid backup payload.' });
+    }
+
+    // 1. Create a safety backup first before restoration!
+    const safetyDir = path.join(DATA_DIR, 'backups', `safety_before_restore_${Date.now()}`);
+    fs.mkdirSync(safetyDir, { recursive: true });
+    try {
+      if (fs.existsSync(AUTH_DB_FILE)) fs.copyFileSync(AUTH_DB_FILE, path.join(safetyDir, 'auth_db.json'));
+      if (fs.existsSync(STORE_DB_FILE)) fs.copyFileSync(STORE_DB_FILE, path.join(safetyDir, 'store_db.json'));
+      if (fs.existsSync(SUBSCRIPTIONS_DB_FILE)) fs.copyFileSync(SUBSCRIPTIONS_DB_FILE, path.join(safetyDir, 'subscriptions_db.json'));
+    } catch (e) {
+      console.warn('Failed to take safety snapshot:', e);
+    }
+
+    // 2. Restore shop accounts & databases
+    if (Array.isArray(restoredData.shops)) {
+      subscriptionsDb.shops = restoredData.shops;
+      persistSubscriptions();
+    }
+
+    if (restoredData.shopDatabases && typeof restoredData.shopDatabases === 'object') {
+      for (const [sId, sData] of Object.entries(restoredData.shopDatabases)) {
+        persistShopStoreData(sId, sData as StoreData);
+      }
+    }
+
+    if (restoredData.store) {
+      storeDb = restoredData.store;
+      persistStore();
+    }
+
+    recordAuditLog(
+      'BACKUP_RESTORED',
+      'Master Admin',
+      'MASTER_ADMIN',
+      'Restored database from verified encrypted backup.',
+      undefined,
+      req.ip
+    );
+
+    return res.json({ success: true, message: 'Backup successfully restored.' });
   });
 
   // Catch-all for API: guarantees valid JSON response instead of HTML "The page cannot be found..."

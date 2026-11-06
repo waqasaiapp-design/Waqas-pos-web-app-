@@ -21,7 +21,7 @@ export {
   safeFetchJson,
   ApiConnectionError,
 } from './apiClient';
-import { getApiBaseUrl } from './apiClient';
+import { getApiBaseUrl, safeFetchJson } from './apiClient';
 
 class SyncService {
   private device: DeviceInfo;

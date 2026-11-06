@@ -27,6 +27,7 @@ import {
   Undo,
   TrendingUp,
   Shield,
+  ShieldCheck,
   Smartphone,
   QrCode,
   Download,
@@ -104,8 +105,7 @@ import { PurchaseReturnsPage } from './components/PurchaseReturnsPage';
 import { SecuritySettingsPage } from './components/SecuritySettingsPage';
 import { CctvPage } from './components/CctvPage';
 import { AllStaffPage } from './components/AllStaffPage';
-import { SuperAdminSubscriptionPage } from './components/SuperAdminSubscriptionPage';
-import { SuperAdminPortal } from './components/SuperAdminPortal';
+import { MasterAdminPortal } from './components/MasterAdminPortal';
 import { LoginGateway } from './components/Auth/LoginGateway';
 import { ForceChangePasswordModal } from './components/Auth/ForceChangePasswordModal';
 import { ShopSubscriptionLockoutScreen } from './components/Auth/ShopSubscriptionLockoutScreen';
@@ -171,8 +171,8 @@ export default function App() {
       const saved = localStorage.getItem('waqas_mart_auth_session');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed?.user?.role === 'SUPER_ADMIN') {
-          return 'Super Admin';
+        if (parsed?.user?.role === 'MASTER_ADMIN') {
+          return 'Master Admin';
         }
       }
     } catch {}
@@ -215,12 +215,12 @@ export default function App() {
     checkSession();
   }, []);
 
-  const handleSuperAdminLoginSuccess = (user: AuthUser, token: string) => {
+  const handleMasterAdminLoginSuccess = (user: AuthUser, token: string) => {
     const session = { token, user };
     setAuthSession(session);
     localStorage.setItem('waqas_mart_auth_session', JSON.stringify(session));
     syncService.setSessionToken(token);
-    setActiveNav('Super Admin');
+    setActiveNav('Master Admin');
   };
 
   const handleShopOwnerLoginSuccess = (user: AuthUser, shop: ShopAccount, token: string) => {
@@ -637,7 +637,7 @@ export default function App() {
       displayName: 'Waqas Ahmad',
       email: 'waqasmart.pos@gmail.com',
       phone: '+92 300 1234567',
-      role: 'Owner / Super Admin',
+      role: 'Master Admin',
       createdAt: new Date().toLocaleDateString('en-GB'),
     };
   });
@@ -1950,12 +1950,12 @@ export default function App() {
       setActiveNav('Total Stock');
     } else if (page === 'Device Management') {
       setActiveNav('Device Management');
-    } else if (page === 'Super Admin' || page === 'Subscription & Payment Management' || page === 'Subscriptions') {
-      if (authSession?.user?.role !== 'SUPER_ADMIN') {
-        alert('Access Restricted: Only authorized Software Owner Super Admin can access the Super Admin Panel.');
+    } else if (page === 'Master Admin') {
+      if (authSession?.user?.role !== 'MASTER_ADMIN') {
+        alert('Access Restricted: Only authenticated Master Admin can access this section.');
         return;
       }
-      setActiveNav('Super Admin');
+      setActiveNav('Master Admin');
     } else {
       setActiveNav(page);
     }
@@ -1963,8 +1963,8 @@ export default function App() {
 
   // Desktop Left Sidebar Navigation Items matching Screenshot 1
   const sidebarNavItems = [
-    ...(authSession?.user?.role === 'SUPER_ADMIN'
-      ? [{ id: 'Super Admin', label: 'Super Admin Portal', icon: Crown }]
+    ...(authSession?.user?.role === 'MASTER_ADMIN'
+      ? [{ id: 'Master Admin', label: 'Master Admin Portal', icon: ShieldCheck }]
       : []),
     { id: 'Home', label: 'Home', icon: Home },
     { id: 'New Sale POS', label: 'New Sale Page', icon: ShoppingBag },
@@ -1988,28 +1988,41 @@ export default function App() {
     { id: 'Settings', label: 'Settings', icon: Settings },
   ];
 
-  // 1. Unauthenticated Login Gateway (Super Admin & Shop Owner options)
+  // 1. Unauthenticated Login Gateway (Shop Login & Master Admin options)
   if (!authSession) {
     return (
       <LoginGateway
-        onSuperAdminSuccess={handleSuperAdminLoginSuccess}
+        onMasterAdminSuccess={handleMasterAdminLoginSuccess}
         onShopOwnerSuccess={handleShopOwnerLoginSuccess}
       />
     );
   }
 
-  // 2. Super Admin Portal (Full 15 Sub-pages)
+  // 2. Master Admin Portal
   if (
-    authSession.user.role === 'SUPER_ADMIN' &&
-    (activeNav === 'Super Admin' ||
-      activeNav === 'Subscription & Payment Management' ||
-      activeNav === 'Subscriptions')
+    authSession.user.role === 'MASTER_ADMIN' &&
+    activeNav === 'Master Admin'
   ) {
     return (
-      <SuperAdminPortal
+      <MasterAdminPortal
         currentUser={authSession.user}
         onLogout={handleLogout}
-        onOpenStorePos={() => setActiveNav('Home')}
+        onOpenShopPos={(shop) => {
+          handleShopOwnerLoginSuccess(
+            {
+              id: `USR-${shop.id}`,
+              username: (shop as any).username,
+              email: shop.email,
+              fullName: shop.ownerName || shop.shopName,
+              role: 'SHOP_OWNER',
+              shopId: shop.id,
+              shopName: shop.shopName,
+              createdAt: shop.createdAt,
+            },
+            shop,
+            `TOKEN-SHOP-${Date.now()}`
+          );
+        }}
       />
     );
   }
@@ -2053,7 +2066,7 @@ export default function App() {
           <span className="text-slate-600 hidden sm:inline">•</span>
           <span
             className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
-              authSession.user.role === 'SUPER_ADMIN'
+              authSession.user.role === 'MASTER_ADMIN'
                 ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                 : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
             }`}
@@ -2061,18 +2074,18 @@ export default function App() {
             {authSession.user.role.replace('_', ' ')}
           </span>
           <span className="hidden md:inline text-slate-400 text-[11px] truncate max-w-xs">
-            {authSession.user.email}
+            {authSession.user.email || authSession.user.username}
           </span>
         </div>
 
         <div className="flex items-center gap-2">
-          {authSession.user.role === 'SUPER_ADMIN' && (
+          {authSession.user.role === 'MASTER_ADMIN' && (
             <button
-              onClick={() => setActiveNav('Super Admin')}
-              className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-slate-950 font-black rounded-lg text-[10px] flex items-center gap-1 cursor-pointer transition-colors"
+              onClick={() => setActiveNav('Master Admin')}
+              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-[10px] flex items-center gap-1 cursor-pointer transition-colors"
             >
-              <Crown className="w-3 h-3" />
-              <span>Super Admin Portal</span>
+              <ShieldCheck className="w-3 h-3" />
+              <span>Master Admin Portal</span>
             </button>
           )}
 
@@ -2475,11 +2488,27 @@ export default function App() {
             onLockNow={() => setIsLocked(true)}
             currentUser={currentUser}
           />
-        ) : activeNav === 'Subscription & Payment Management' || activeNav === 'Super Admin' || activeNav === 'Subscriptions' ? (
-          /* PAGE: SUPER ADMIN SUBSCRIPTION & PAYMENT MANAGEMENT */
-          <SuperAdminSubscriptionPage
-            onBackToDashboard={() => handleNavigate('Home')}
-            currentShopName={branding.storeName}
+        ) : activeNav === 'Master Admin' ? (
+          /* PAGE: MASTER ADMIN PORTAL */
+          <MasterAdminPortal
+            currentUser={authSession.user}
+            onLogout={handleLogout}
+            onOpenShopPos={(shop) => {
+              handleShopOwnerLoginSuccess(
+                {
+                  id: `USR-${shop.id}`,
+                  username: (shop as any).username,
+                  email: shop.email,
+                  fullName: shop.ownerName || shop.shopName,
+                  role: 'SHOP_OWNER',
+                  shopId: shop.id,
+                  shopName: shop.shopName,
+                  createdAt: shop.createdAt,
+                },
+                shop,
+                `TOKEN-SHOP-${Date.now()}`
+              );
+            }}
           />
         ) : (
           /* DEFAULT: NEW SALE POS WORKSTATION */
@@ -2820,7 +2849,7 @@ export default function App() {
       {mustChangePassword && (
         <ForceChangePasswordModal
           isOpen={true}
-          userEmail={authSession.user.email}
+          userEmail={authSession.user.email || authSession.user.username || 'shop@local'}
           sessionToken={authSession.token}
           onPasswordChanged={() => setMustChangePassword(false)}
         />

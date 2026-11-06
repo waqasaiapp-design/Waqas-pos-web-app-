@@ -1,778 +1,569 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  Shield,
+  ShieldCheck,
   Store,
-  Mail,
   Lock,
   Eye,
   EyeOff,
   KeyRound,
-  CheckCircle2,
   AlertCircle,
   HelpCircle,
-  Phone,
-  MessageCircle,
+  CheckCircle2,
+  Clock,
   Sparkles,
   ArrowRight,
-  Crown,
-  ChevronRight,
-  RefreshCw,
-  X,
-  Server,
-  Wrench,
-  Globe,
+  HardDrive,
+  Info,
+  UserCheck,
+  RotateCcw,
 } from 'lucide-react';
-import { AuthUser, ShopAccount, UserRole } from '../../types/pos';
+import { AuthUser, ShopAccount } from '../../types/pos';
+import { safeFetchJson } from '../../utils/apiClient';
 import {
-  getApiBaseUrl,
-  safeFetchJson,
-  ApiConnectionError,
-} from '../../utils/apiClient';
-import { ServerConnectionModal } from '../ServerConnectionModal';
+  getLockoutStatus,
+  recordFailedLoginAttempt,
+  resetLoginAttempts,
+  hashPasswordClient,
+} from '../../utils/cryptoSecurity';
+import { MasterAdminSetupModal } from './MasterAdminSetupModal';
+import { MasterAdminRecoveryModal } from './MasterAdminRecoveryModal';
+import { ResetMasterPasswordModal } from './ResetMasterPasswordModal';
 import confetti from 'canvas-confetti';
 
 interface LoginGatewayProps {
-  onSuperAdminSuccess: (user: AuthUser, token: string) => void;
+  onMasterAdminSuccess: (user: AuthUser, token: string) => void;
   onShopOwnerSuccess: (user: AuthUser, shop: ShopAccount, token: string) => void;
 }
 
 export const LoginGateway: React.FC<LoginGatewayProps> = ({
-  onSuperAdminSuccess,
+  onMasterAdminSuccess,
   onShopOwnerSuccess,
 }) => {
-  // Tab: 'SUPER_ADMIN' | 'SHOP_OWNER'
-  const [activeTab, setActiveTab] = useState<'SUPER_ADMIN' | 'SHOP_OWNER'>('SUPER_ADMIN');
+  // Tab: 'SHOP_LOGIN' | 'MASTER_ADMIN'
+  const [activeTab, setActiveTab] = useState<'SHOP_LOGIN' | 'MASTER_ADMIN'>('SHOP_LOGIN');
 
-  // Super Admin form state
-  const [adminEmail, setAdminEmail] = useState('waqaspos.admin@gmail.com');
-  const [adminPassword, setAdminPassword] = useState('WaqasAdmin@2026');
+  // Master Admin state
+  const [adminUsername, setAdminUsername] = useState('admin');
+  const [adminPassword, setAdminPassword] = useState('');
   const [showAdminPassword, setShowAdminPassword] = useState(false);
   const [adminLoading, setAdminLoading] = useState(false);
-  const [adminError, setAdminError] = useState<{ text: string; isHtml: boolean } | null>(null);
+  const [adminError, setAdminError] = useState<string | null>(null);
 
-  // Shop Owner form state
-  const [shopEmail, setShopEmail] = useState('waqasmart.pos@gmail.com');
-  const [shopPassword, setShopPassword] = useState('ShopOwner@123');
+  // Shop Owner state
+  const [shopUsername, setShopUsername] = useState('waqasmart');
+  const [shopPassword, setShopPassword] = useState('');
   const [showShopPassword, setShowShopPassword] = useState(false);
   const [shopLoading, setShopLoading] = useState(false);
-  const [shopError, setShopError] = useState<{ text: string; isHtml: boolean } | null>(null);
+  const [shopError, setShopError] = useState<string | null>(null);
 
-  // Server Settings Modal State
-  const [serverModalOpen, setServerModalOpen] = useState(false);
-  const [currentServerUrl, setCurrentServerUrl] = useState(() => getApiBaseUrl());
+  // Setup & Recovery Modals
+  const [isConfigured, setIsConfigured] = useState<boolean>(true);
+  const [showSetupModal, setShowSetupModal] = useState<boolean>(false);
+  const [showRecoveryModal, setShowRecoveryModal] = useState<boolean>(false);
+  const [showResetPasswordModal, setShowResetPasswordModal] = useState<boolean>(false);
 
-  // Forgot Password modal state
-  const [forgotModalOpen, setForgotModalOpen] = useState(false);
-  const [forgotEmail, setForgotEmail] = useState('');
-  const [forgotRole, setForgotRole] = useState<'SUPER_ADMIN' | 'SHOP_OWNER'>('SUPER_ADMIN');
-  const [forgotStep, setForgotStep] = useState<'request' | 'reset'>('request');
-  const [resetCodeInput, setResetCodeInput] = useState('');
-  const [generatedResetCode, setGeneratedResetCode] = useState<string | null>(null);
-  const [newPasswordInput, setNewPasswordInput] = useState('');
-  const [forgotLoading, setForgotLoading] = useState(false);
-  const [forgotMessage, setForgotMessage] = useState<{ text: string; isError: boolean } | null>(null);
+  // Lockout Timers
+  const [adminLockout, setAdminLockout] = useState<{ isLocked: boolean; remainingSeconds: number }>({
+    isLocked: false,
+    remainingSeconds: 0,
+  });
+  const [shopLockout, setShopLockout] = useState<{ isLocked: boolean; remainingSeconds: number }>({
+    isLocked: false,
+    remainingSeconds: 0,
+  });
 
-  // Handle Super Admin Login
-  const handleSuperAdminLogin = async (e: React.FormEvent) => {
+  // Check Master Admin configuration status on mount
+  useEffect(() => {
+    const checkMasterAdminStatus = async () => {
+      try {
+        const res = await safeFetchJson('/api/auth/master-admin/status');
+        if (res.data) {
+          setIsConfigured(res.data.isConfigured);
+          if (!res.data.isConfigured) {
+            setShowSetupModal(true);
+          }
+        }
+      } catch {
+        // Fallback to local offline check
+        const offlineFlag = localStorage.getItem('waqas_pos_master_admin_configured');
+        const offlineMaster = localStorage.getItem('waqas_pos_offline_master_admin');
+        if (offlineFlag === 'true' && offlineMaster) {
+          setIsConfigured(true);
+        } else {
+          setIsConfigured(false);
+          setShowSetupModal(true);
+        }
+      }
+    };
+
+    checkMasterAdminStatus();
+  }, []);
+
+  // Update Lockout countdown every second
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const aLock = getLockoutStatus(`admin_${adminUsername}`);
+      setAdminLockout({ isLocked: aLock.isLocked, remainingSeconds: aLock.remainingSeconds });
+
+      const sLock = getLockoutStatus(`shop_${shopUsername}`);
+      setShopLockout({ isLocked: sLock.isLocked, remainingSeconds: sLock.remainingSeconds });
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [adminUsername, shopUsername]);
+
+  const formatLockoutTime = (sec: number) => {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
+  };
+
+  // Handle Master Admin Login
+  const handleMasterAdminLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAdminError(null);
+
+    const lock = getLockoutStatus(`admin_${adminUsername}`);
+    if (lock.isLocked) {
+      setAdminError(`Account temporarily locked due to failed attempts. Try again in ${formatLockoutTime(lock.remainingSeconds)}.`);
+      return;
+    }
+
     setAdminLoading(true);
 
     try {
-      const res = await safeFetchJson('/api/auth/super-admin/login', {
+      const res = await safeFetchJson('/api/auth/master-admin/login', {
         method: 'POST',
         body: JSON.stringify({
-          email: adminEmail.trim(),
-          password: adminPassword.trim(),
+          username: adminUsername.trim().toLowerCase(),
+          password: adminPassword,
         }),
       });
 
       const data = res.data;
       if (!data || !data.success) {
-        throw new Error(data?.message || 'Super Admin authentication failed. Invalid credentials.');
+        throw new Error(data?.message || 'Invalid Master Admin username or password.');
       }
 
-      confetti({ particleCount: 80, spread: 70, origin: { y: 0.6 } });
-      onSuperAdminSuccess(data.user, data.token);
+      resetLoginAttempts(`admin_${adminUsername}`);
+      confetti({ particleCount: 70, spread: 60, origin: { y: 0.6 } });
+      onMasterAdminSuccess(data.user, data.token);
     } catch (err: any) {
-      const isHtml = err?.isHtmlResponse || false;
-      const msg = err?.message || 'Error signing in. Please verify Super Admin credentials.';
-      setAdminError({ text: msg, isHtml });
+      // Check offline local verification if backend unreachable
+      if (err?.status === 0 || err?.name === 'ApiConnectionError') {
+        const offlineMaster = localStorage.getItem('waqas_pos_offline_master_admin');
+        if (offlineMaster) {
+          try {
+            const parsed = JSON.parse(offlineMaster);
+            const computed = await hashPasswordClient(adminPassword, parsed.passwordSalt);
+            if (
+              parsed.user?.username?.toLowerCase() === adminUsername.trim().toLowerCase() &&
+              computed === parsed.passwordHash
+            ) {
+              resetLoginAttempts(`admin_${adminUsername}`);
+              const offlineToken = `TOKEN-OFFLINE-MASTER-${Date.now()}`;
+              confetti({ particleCount: 70, spread: 60, origin: { y: 0.6 } });
+              onMasterAdminSuccess(parsed.user, offlineToken);
+              setAdminLoading(false);
+              return;
+            }
+          } catch {}
+        }
+      }
+
+      const lockResult = recordFailedLoginAttempt(`admin_${adminUsername}`);
+      if (lockResult.isLocked) {
+        setAdminError(`Account locked for 15 minutes due to 5 failed attempts.`);
+      } else {
+        const remaining = 5 - lockResult.attemptsCount;
+        setAdminError(
+          err?.message || `Incorrect username or password. (${remaining} attempt${remaining === 1 ? '' : 's'} remaining)`
+        );
+      }
     } finally {
       setAdminLoading(false);
     }
   };
 
-  // Handle Shop Owner Login
-  const handleShopOwnerLogin = async (e: React.FormEvent) => {
+  // Handle Shop POS Login
+  const handleShopLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setShopError(null);
+
+    const lock = getLockoutStatus(`shop_${shopUsername}`);
+    if (lock.isLocked) {
+      setShopError(`Account temporarily locked. Try again in ${formatLockoutTime(lock.remainingSeconds)}.`);
+      return;
+    }
+
     setShopLoading(true);
 
     try {
       const res = await safeFetchJson('/api/auth/shop-owner/login', {
         method: 'POST',
         body: JSON.stringify({
-          email: shopEmail.trim(),
-          password: shopPassword.trim(),
+          username: shopUsername.trim().toLowerCase(),
+          email: shopUsername.trim().toLowerCase(),
+          password: shopPassword,
         }),
       });
 
       const data = res.data;
       if (!data || !data.success) {
-        throw new Error(data?.message || 'Shop Owner authentication failed. Invalid credentials or expired account.');
+        throw new Error(data?.message || 'Invalid shop credentials or shop deactivated.');
       }
 
-      confetti({ particleCount: 70, spread: 60, origin: { y: 0.6 } });
+      resetLoginAttempts(`shop_${shopUsername}`);
+      confetti({ particleCount: 60, spread: 50, origin: { y: 0.6 } });
       onShopOwnerSuccess(data.user, data.shop, data.token);
     } catch (err: any) {
-      const isHtml = err?.isHtmlResponse || false;
-      const msg = err?.message || 'Error signing in. Ensure account is registered by Super Admin.';
-      setShopError({ text: msg, isHtml });
+      // Offline fallback for shop
+      if (err?.status === 0 || err?.name === 'ApiConnectionError') {
+        const offlineShops = localStorage.getItem('waqas_pos_offline_shops');
+        if (offlineShops) {
+          try {
+            const list: any[] = JSON.parse(offlineShops);
+            const found = list.find(
+              (s) =>
+                s.username?.toLowerCase() === shopUsername.trim().toLowerCase() ||
+                s.email?.toLowerCase() === shopUsername.trim().toLowerCase()
+            );
+            if (found) {
+              if (found.status === 'inactive') {
+                setShopError('This shop account has been deactivated by Master Admin.');
+                setShopLoading(false);
+                return;
+              }
+              const computed = await hashPasswordClient(shopPassword, found.passwordSalt);
+              if (computed === found.passwordHash) {
+                resetLoginAttempts(`shop_${shopUsername}`);
+                const offlineToken = `TOKEN-OFFLINE-SHOP-${Date.now()}`;
+                const userObj: AuthUser = {
+                  id: found.userId || `USR-${found.id}`,
+                  username: found.username,
+                  email: found.email,
+                  fullName: found.ownerName || found.shopName,
+                  role: 'SHOP_OWNER',
+                  shopId: found.id,
+                  shopName: found.shopName,
+                  createdAt: found.createdAt,
+                };
+                confetti({ particleCount: 60, spread: 50, origin: { y: 0.6 } });
+                onShopOwnerSuccess(userObj, found, offlineToken);
+                setShopLoading(false);
+                return;
+              }
+            }
+          } catch {}
+        }
+      }
+
+      const lockResult = recordFailedLoginAttempt(`shop_${shopUsername}`);
+      if (lockResult.isLocked) {
+        setShopError(`Account locked for 15 minutes due to 5 failed attempts.`);
+      } else {
+        const remaining = 5 - lockResult.attemptsCount;
+        setShopError(
+          err?.message || `Incorrect credentials. (${remaining} attempt${remaining === 1 ? '' : 's'} remaining)`
+        );
+      }
     } finally {
       setShopLoading(false);
     }
   };
 
-  // Handle Request Password Reset Code
-  const handleRequestResetCode = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setForgotMessage(null);
-    setForgotLoading(true);
-
-    try {
-      const res = await safeFetchJson('/api/auth/forgot-password', {
-        method: 'POST',
-        body: JSON.stringify({
-          email: forgotEmail.trim(),
-          role: forgotRole,
-        }),
-      });
-
-      const data = res.data;
-      if (!data || !data.success) {
-        throw new Error(data?.message || 'Failed to request reset code.');
-      }
-
-      setGeneratedResetCode(data.resetCode);
-      setResetCodeInput(data.resetCode || '');
-      setForgotStep('reset');
-      setForgotMessage({
-        text: `Security code generated! Valid for ${data.expiresMinutes || 30} minutes.`,
-        isError: false,
-      });
-    } catch (err: any) {
-      setForgotMessage({ text: err.message || 'Error requesting reset code.', isError: true });
-    } finally {
-      setForgotLoading(false);
-    }
-  };
-
-  // Handle Confirm Reset Password
-  const handleConfirmResetPassword = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setForgotMessage(null);
-    setForgotLoading(true);
-
-    try {
-      const res = await safeFetchJson('/api/auth/reset-password', {
-        method: 'POST',
-        body: JSON.stringify({
-          email: forgotEmail.trim(),
-          resetCode: resetCodeInput.trim(),
-          newPassword: newPasswordInput.trim(),
-        }),
-      });
-
-      const data = res.data;
-      if (!data || !data.success) {
-        throw new Error(data?.message || 'Failed to reset password.');
-      }
-
-      setForgotMessage({ text: 'Password reset successfully! You can now log in.', isError: false });
-      setTimeout(() => {
-        setForgotModalOpen(false);
-        setForgotStep('request');
-        if (forgotRole === 'SUPER_ADMIN') {
-          setAdminPassword(newPasswordInput);
-        } else {
-          setShopPassword(newPasswordInput);
-        }
-      }, 1500);
-    } catch (err: any) {
-      setForgotMessage({ text: err.message || 'Error resetting password.', isError: true });
-    } finally {
-      setForgotLoading(false);
-    }
-  };
-
-  const openForgotModal = (role: 'SUPER_ADMIN' | 'SHOP_OWNER', defaultEmail: string) => {
-    setForgotRole(role);
-    setForgotEmail(defaultEmail);
-    setForgotStep('request');
-    setGeneratedResetCode(null);
-    setResetCodeInput('');
-    setNewPasswordInput('');
-    setForgotMessage(null);
-    setForgotModalOpen(true);
-  };
-
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between selection:bg-emerald-500 selection:text-white relative overflow-hidden">
-      {/* Background radial luxury lighting */}
-      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[1000px] h-[550px] bg-[radial-gradient(ellipse_at_top,rgba(5,122,68,0.22),transparent_70%)] pointer-events-none" />
-      <div className="absolute -bottom-20 -right-20 w-96 h-96 bg-amber-500/5 rounded-full blur-3xl pointer-events-none" />
-      <div className="absolute -top-20 -left-20 w-96 h-96 bg-emerald-500/5 rounded-full blur-3xl pointer-events-none" />
+    <div className="min-h-screen bg-slate-950 flex flex-col justify-center items-center p-4 relative selection:bg-emerald-500 selection:text-white">
+      {/* Background Ambience */}
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_var(--tw-gradient-stops))] from-emerald-950/30 via-slate-950 to-slate-950 -z-10" />
 
-      {/* Top Header / Brand Bar */}
-      <header className="border-b border-slate-800/80 bg-slate-900/50 backdrop-blur-md px-4 sm:px-8 py-3.5 flex items-center justify-between z-10">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-700 flex items-center justify-center shadow-lg shadow-emerald-950/50 border border-emerald-400/30">
-            <Store className="w-5 h-5 text-white stroke-[2.2]" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-black text-base sm:text-lg tracking-tight text-white">
-                WAQAS POS SOFTWARE
-              </span>
-              <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-widest bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
-                v2.6 Enterprise
-              </span>
+      {/* Main Authentication Card */}
+      <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden backdrop-blur-xl">
+        {/* Unconfigured Notice Banner */}
+        {!isConfigured && (
+          <div className="bg-gradient-to-r from-amber-600 to-amber-700 px-5 py-3 text-white flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2 font-medium">
+              <Sparkles className="w-4 h-4 shrink-0" />
+              <span>One-Time Master Admin Setup Required</span>
             </div>
-            <p className="text-[11px] text-slate-400 font-medium hidden sm:block">
-              Supermarket & Retail Multi-Tenant Management System
-            </p>
+            <button
+              onClick={() => setShowSetupModal(true)}
+              className="px-2.5 py-1 rounded-lg bg-white text-amber-900 font-bold hover:bg-amber-100 transition cursor-pointer"
+            >
+              Configure Now
+            </button>
           </div>
-        </div>
+        )}
 
-        {/* Software Owner Badge */}
-        <div className="flex items-center gap-2 text-right">
-          <div className="hidden md:block">
-            <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block">
-              Software Owner & Developer
-            </span>
-            <span className="text-xs font-black text-emerald-400">Muhammad Waqas</span>
+        {/* Card Header */}
+        <div className="p-6 text-center border-b border-slate-800/80 bg-slate-900/50">
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-tr from-emerald-600 to-teal-500 text-white mb-3 shadow-lg shadow-emerald-900/40">
+            <ShieldCheck className="w-8 h-8" />
           </div>
-          <a
-            href="https://wa.me/923228570782"
-            target="_blank"
-            rel="noreferrer"
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-950/70 hover:bg-emerald-900/80 border border-emerald-500/40 text-emerald-300 text-xs font-bold transition-all"
-            title="Chat with Muhammad Waqas on WhatsApp"
-          >
-            <MessageCircle className="w-3.5 h-3.5 fill-emerald-400" />
-            <span className="hidden sm:inline">03228570782</span>
-          </a>
-        </div>
-      </header>
-
-      {/* Main Container */}
-      <main className="flex-1 flex flex-col items-center justify-center p-4 sm:p-6 z-10 max-w-4xl mx-auto w-full">
-        {/* Title & Gateway Switcher */}
-        <div className="text-center mb-6 space-y-2">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-800/80 border border-slate-700 text-xs font-semibold text-slate-300">
-            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-            <span>Select Your Authentication Portal</span>
-          </div>
-          <h2 className="text-2xl sm:text-3xl font-black tracking-tight text-white">
-            Welcome to WAQAS POS Gateway
-          </h2>
-          <p className="text-xs sm:text-sm text-slate-400 max-w-md mx-auto">
-            Choose either Super Admin Software Owner access or Authorized Shop Owner login.
+          <h1 className="text-xl font-black tracking-tight text-white">WAQAS POS SOFTWARE</h1>
+          <p className="text-xs text-slate-400 mt-1">
+            Private, Encrypted & 100% Offline Device POS System
           </p>
 
-          {/* TWO SEPARATE PORTAL SWITCHER BUTTONS */}
-          <div className="grid grid-cols-2 gap-2 p-1.5 bg-slate-900/90 border border-slate-800 rounded-2xl max-w-md mx-auto mt-4 shadow-xl">
+          {/* Tab Selector */}
+          <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-950/70 rounded-2xl border border-slate-800 mt-5">
             <button
               type="button"
-              onClick={() => setActiveTab('SUPER_ADMIN')}
-              className={`py-3 px-3 rounded-xl font-black text-xs sm:text-sm flex items-center justify-center gap-2 transition-all cursor-pointer ${
-                activeTab === 'SUPER_ADMIN'
-                  ? 'bg-gradient-to-r from-amber-600 to-yellow-600 text-white shadow-lg shadow-amber-950/60 ring-1 ring-amber-400/40'
-                  : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
-              }`}
-            >
-              <Crown className="w-4 h-4" />
-              <span>SUPER ADMIN</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveTab('SHOP_OWNER')}
-              className={`py-3 px-3 rounded-xl font-black text-xs sm:text-sm flex items-center justify-center gap-2 transition-all cursor-pointer ${
-                activeTab === 'SHOP_OWNER'
-                  ? 'bg-gradient-to-r from-emerald-600 to-teal-700 text-white shadow-lg shadow-emerald-950/60 ring-1 ring-emerald-400/40'
-                  : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+              onClick={() => {
+                setActiveTab('SHOP_LOGIN');
+                setShopError(null);
+              }}
+              className={`py-2 px-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                activeTab === 'SHOP_LOGIN'
+                  ? 'bg-emerald-600 text-white shadow-md'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
               }`}
             >
               <Store className="w-4 h-4" />
-              <span>SHOP OWNER</span>
+              <span>Shop POS Login</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('MASTER_ADMIN');
+                setAdminError(null);
+              }}
+              className={`py-2 px-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                activeTab === 'MASTER_ADMIN'
+                  ? 'bg-emerald-600 text-white shadow-md'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
+              }`}
+            >
+              <Lock className="w-4 h-4" />
+              <span>Master Admin</span>
             </button>
           </div>
         </div>
 
-        {/* ============================================================== */}
-        {/* 1. SUPER ADMIN LOGIN PANEL                                     */}
-        {/* ============================================================== */}
-        {activeTab === 'SUPER_ADMIN' && (
-          <div className="w-full max-w-md bg-slate-900/95 border border-amber-500/30 rounded-3xl shadow-2xl p-6 sm:p-8 backdrop-blur-md animate-in fade-in zoom-in-95 duration-200">
-            {/* Header info */}
-            <div className="flex items-center gap-3.5 mb-5 pb-4 border-b border-slate-800">
-              <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-amber-500 to-yellow-600 flex items-center justify-center text-slate-950 shadow-lg shadow-amber-950/50">
-                <Crown className="w-6 h-6 stroke-[2.5]" />
-              </div>
-              <div>
-                <div className="flex items-center gap-1.5">
-                  <h3 className="font-black text-lg text-white">Super Admin Portal</h3>
-                  <span className="px-1.5 py-0.5 rounded text-[10px] font-extrabold bg-amber-500/20 text-amber-300 border border-amber-400/30">
-                    MASTER
-                  </span>
-                </div>
-                <p className="text-xs text-amber-200/80 font-medium">Software Owner Master Control</p>
-              </div>
-            </div>
-
-            {/* Error banner */}
-            {adminError && (
-              <div className="mb-4 p-3.5 bg-red-950/70 border border-red-500/50 text-red-200 text-xs rounded-2xl space-y-2">
-                <div className="flex items-start gap-2">
-                  <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                  <span className="leading-relaxed">{adminError.text}</span>
-                </div>
-                {adminError.isHtml && (
-                  <div className="pt-2 border-t border-red-500/30 flex items-center justify-between">
-                    <span className="text-[11px] text-amber-300 font-urdu" dir="rtl">
-                      سرور سے رابطہ نہیں ہو سکا۔ API ایڈریس درست کریں:
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setServerModalOpen(true)}
-                      className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black rounded-lg text-[10px] flex items-center gap-1 cursor-pointer transition-colors"
-                    >
-                      <Wrench className="w-3 h-3" />
-                      <span>Configure Server URL</span>
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
-
-            <form onSubmit={handleSuperAdminLogin} className="space-y-4">
-              {/* Field 1: Super Admin Gmail */}
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold text-slate-300 uppercase tracking-wide flex items-center justify-between">
-                  <span>Super Admin Gmail</span>
-                  <span className="text-[10px] text-amber-400/90 font-medium">Authorized Account</span>
-                </label>
-                <div className="relative">
-                  <input
-                    type="email"
-                    value={adminEmail}
-                    onChange={(e) => setAdminEmail(e.target.value)}
-                    placeholder="waqaspos.admin@gmail.com"
-                    required
-                    className="w-full pl-10 pr-3 py-3 bg-slate-950/70 border border-slate-700/80 rounded-xl text-sm font-semibold text-white placeholder-slate-500 focus:outline-hidden focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-all"
-                  />
-                  <Mail className="w-4 h-4 text-slate-500 absolute left-3.5 top-3.5 pointer-events-none" />
-                </div>
-              </div>
-
-              {/* Field 2: Password with Show/Hide */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-slate-300 uppercase tracking-wide">
-                    Master Password
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => openForgotModal('SUPER_ADMIN', adminEmail)}
-                    className="text-xs text-amber-400 hover:text-amber-300 hover:underline cursor-pointer font-semibold"
-                  >
-                    Forgot Password?
-                  </button>
-                </div>
-                <div className="relative">
-                  <input
-                    type={showAdminPassword ? 'text' : 'password'}
-                    value={adminPassword}
-                    onChange={(e) => setAdminPassword(e.target.value)}
-                    placeholder="Enter Master Password"
-                    required
-                    className="w-full pl-10 pr-10 py-3 bg-slate-950/70 border border-slate-700/80 rounded-xl text-sm font-semibold text-white placeholder-slate-500 focus:outline-hidden focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-all"
-                  />
-                  <Lock className="w-4 h-4 text-slate-500 absolute left-3.5 top-3.5 pointer-events-none" />
-                  <button
-                    type="button"
-                    onClick={() => setShowAdminPassword(!showAdminPassword)}
-                    className="absolute right-3 top-3 text-slate-400 hover:text-slate-200 cursor-pointer p-0.5"
-                    title={showAdminPassword ? 'Hide password' : 'Show password'}
-                  >
-                    {showAdminPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
-                </div>
-              </div>
-
-              {/* Login Button */}
-              <button
-                type="submit"
-                disabled={adminLoading}
-                className="w-full py-3.5 bg-gradient-to-r from-amber-600 via-yellow-600 to-amber-600 hover:brightness-110 active:scale-[0.99] text-slate-950 font-black text-sm rounded-xl shadow-lg shadow-amber-950/40 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 mt-2"
-              >
-                {adminLoading ? (
-                  <span className="flex items-center gap-2">
-                    <RefreshCw className="w-4 h-4 animate-spin text-slate-950" />
-                    <span>Authenticating Master Session...</span>
-                  </span>
-                ) : (
-                  <>
-                    <span>Login to Super Admin Dashboard</span>
-                    <ArrowRight className="w-4 h-4" />
-                  </>
-                )}
-              </button>
-            </form>
-
-            {/* Software Owner Information Box */}
-            <div className="mt-6 pt-4 border-t border-slate-800 text-xs text-slate-400 space-y-1.5">
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="font-bold text-slate-300">Software Name:</span>
-                <span className="text-amber-300 font-extrabold">WAQAS POS SOFTWARE</span>
-              </div>
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="font-bold text-slate-300">Software Owner:</span>
-                <span className="text-white font-extrabold">Muhammad Waqas</span>
-              </div>
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="font-bold text-slate-300">Support WhatsApp:</span>
-                <a
-                  href="https://wa.me/923228570782"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-emerald-400 hover:underline font-bold"
-                >
-                  03228570782
-                </a>
-              </div>
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="font-bold text-slate-300">Support Mobile:</span>
-                <span className="text-slate-200 font-bold">03429634133</span>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ============================================================== */}
-        {/* 2. SHOP OWNER LOGIN PANEL                                      */}
-        {/* ============================================================== */}
-        {activeTab === 'SHOP_OWNER' && (
-          <div className="w-full max-w-md bg-slate-900/95 border border-emerald-500/30 rounded-3xl shadow-2xl p-6 sm:p-8 backdrop-blur-md animate-in fade-in zoom-in-95 duration-200">
-            {/* Header info */}
-            <div className="flex items-center gap-3.5 mb-5 pb-4 border-b border-slate-800">
-              <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-700 flex items-center justify-center text-white shadow-lg shadow-emerald-950/50">
-                <Store className="w-6 h-6 stroke-[2.2]" />
-              </div>
-              <div>
-                <div className="flex items-center gap-1.5">
-                  <h3 className="font-black text-lg text-white">Shop Owner Login</h3>
-                  <span className="px-1.5 py-0.5 rounded text-[10px] font-extrabold bg-emerald-500/20 text-emerald-300 border border-emerald-400/30">
-                    POS
-                  </span>
-                </div>
-                <p className="text-xs text-emerald-200/80 font-medium">Store Terminal Workstation Access</p>
-              </div>
-            </div>
-
-            {/* Error banner */}
+        {/* Tab 1: Shop POS Login */}
+        {activeTab === 'SHOP_LOGIN' && (
+          <form onSubmit={handleShopLogin} className="p-6 space-y-4 text-xs">
             {shopError && (
-              <div className="mb-4 p-3.5 bg-red-950/70 border border-red-500/50 text-red-200 text-xs rounded-2xl space-y-2">
-                <div className="flex items-start gap-2">
-                  <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                  <span className="leading-relaxed">{shopError.text}</span>
-                </div>
-                {shopError.isHtml && (
-                  <div className="pt-2 border-t border-red-500/30 flex items-center justify-between">
-                    <span className="text-[11px] text-emerald-300 font-urdu" dir="rtl">
-                      سرور سے رابطہ نہیں ہو سکا۔ API ایڈریس درست کریں:
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setServerModalOpen(true)}
-                      className="px-2.5 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black rounded-lg text-[10px] flex items-center gap-1 cursor-pointer transition-colors"
-                    >
-                      <Wrench className="w-3 h-3" />
-                      <span>Configure Server URL</span>
-                    </button>
-                  </div>
-                )}
+              <div className="p-3 rounded-xl bg-red-950/80 border border-red-500/40 text-red-200 flex items-start gap-2.5">
+                <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <span>{shopError}</span>
               </div>
             )}
 
-            <form onSubmit={handleShopOwnerLogin} className="space-y-4">
-              {/* Field 1: Registered Gmail */}
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold text-slate-300 uppercase tracking-wide flex items-center justify-between">
-                  <span>Registered Shop Gmail</span>
-                  <span className="text-[10px] text-emerald-400/90 font-medium">Assigned by Super Admin</span>
-                </label>
-                <div className="relative">
-                  <input
-                    type="email"
-                    value={shopEmail}
-                    onChange={(e) => setShopEmail(e.target.value)}
-                    placeholder="e.g. yourshop.pos@gmail.com"
-                    required
-                    className="w-full pl-10 pr-3 py-3 bg-slate-950/70 border border-slate-700/80 rounded-xl text-sm font-semibold text-white placeholder-slate-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-all"
-                  />
-                  <Mail className="w-4 h-4 text-slate-500 absolute left-3.5 top-3.5 pointer-events-none" />
-                </div>
+            {shopLockout.isLocked && (
+              <div className="p-3 rounded-xl bg-amber-950/80 border border-amber-500/40 text-amber-200 flex items-center gap-2.5">
+                <Clock className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>Account locked. Try again in {formatLockoutTime(shopLockout.remainingSeconds)}</span>
               </div>
+            )}
 
-              {/* Field 2: Password with Show/Hide */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-slate-300 uppercase tracking-wide">
-                    Shop Password
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => openForgotModal('SHOP_OWNER', shopEmail)}
-                    className="text-xs text-emerald-400 hover:text-emerald-300 hover:underline cursor-pointer font-semibold"
-                  >
-                    Forgot Password?
-                  </button>
-                </div>
-                <div className="relative">
-                  <input
-                    type={showShopPassword ? 'text' : 'password'}
-                    value={shopPassword}
-                    onChange={(e) => setShopPassword(e.target.value)}
-                    placeholder="Enter Shop Password"
-                    required
-                    className="w-full pl-10 pr-10 py-3 bg-slate-950/70 border border-slate-700/80 rounded-xl text-sm font-semibold text-white placeholder-slate-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-all"
-                  />
-                  <Lock className="w-4 h-4 text-slate-500 absolute left-3.5 top-3.5 pointer-events-none" />
-                  <button
-                    type="button"
-                    onClick={() => setShowShopPassword(!showShopPassword)}
-                    className="absolute right-3 top-3 text-slate-400 hover:text-slate-200 cursor-pointer p-0.5"
-                    title={showShopPassword ? 'Hide password' : 'Show password'}
-                  >
-                    {showShopPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
-                </div>
-              </div>
+            <div>
+              <label className="block text-slate-300 font-semibold mb-1">
+                Shop Username / Email
+              </label>
+              <input
+                type="text"
+                required
+                disabled={shopLockout.isLocked}
+                value={shopUsername}
+                onChange={(e) => setShopUsername(e.target.value)}
+                placeholder="e.g. waqasmart"
+                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-800/80 border border-slate-700 text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 text-xs font-medium"
+              />
+            </div>
 
-              {/* Login Button */}
-              <button
-                type="submit"
-                disabled={shopLoading}
-                className="w-full py-3.5 bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-600 hover:brightness-110 active:scale-[0.99] text-white font-black text-sm rounded-xl shadow-lg shadow-emerald-950/40 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 mt-2"
-              >
-                {shopLoading ? (
-                  <span className="flex items-center gap-2">
-                    <RefreshCw className="w-4 h-4 animate-spin text-white" />
-                    <span>Verifying Store Account...</span>
-                  </span>
-                ) : (
-                  <>
-                    <span>Login to POS Workstation</span>
-                    <ArrowRight className="w-4 h-4" />
-                  </>
-                )}
-              </button>
-            </form>
-
-            {/* Shop Activation Notice */}
-            <div className="mt-6 pt-4 border-t border-slate-800 text-xs text-slate-400 space-y-2">
-              <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800 flex items-start gap-2.5">
-                <HelpCircle className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                <p className="text-[11px] leading-relaxed">
-                  Only accounts provisioned by Super Admin can access the system. No public self-registration. For new mart activation, contact{' '}
-                  <span className="text-emerald-300 font-bold">Muhammad Waqas</span>: 03228570782.
-                </p>
+            <div>
+              <label className="block text-slate-300 font-semibold mb-1">
+                Shop Password
+              </label>
+              <div className="relative">
+                <input
+                  type={showShopPassword ? 'text' : 'password'}
+                  required
+                  disabled={shopLockout.isLocked}
+                  value={shopPassword}
+                  onChange={(e) => setShopPassword(e.target.value)}
+                  placeholder="Enter shop password"
+                  className="w-full px-3.5 py-2.5 pr-10 rounded-xl bg-slate-800/80 border border-slate-700 text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 text-xs"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowShopPassword(!showShopPassword)}
+                  className="absolute right-3 top-2.5 text-slate-400 hover:text-white"
+                >
+                  {showShopPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
               </div>
             </div>
-          </div>
+
+            <button
+              type="submit"
+              disabled={shopLoading || shopLockout.isLocked}
+              className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold transition shadow-lg shadow-emerald-950 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Store className="w-4 h-4" />
+              <span>{shopLoading ? 'Authenticating...' : 'Sign In to Shop POS'}</span>
+              <ArrowRight className="w-4 h-4" />
+            </button>
+
+            <p className="text-[11px] text-slate-400 text-center leading-relaxed pt-2">
+              Only authorized shop accounts created by the Master Admin can access store operations.
+            </p>
+          </form>
         )}
-      </main>
 
-      {/* Footer Support Bar & Server Connection Pill */}
-      <footer className="border-t border-slate-800/80 bg-slate-900/40 px-4 py-3 text-center text-xs text-slate-500 z-10 flex flex-col sm:flex-row items-center justify-between gap-3 max-w-4xl mx-auto w-full">
-        <div className="flex items-center gap-2 text-slate-400">
-          <span>WAQAS POS SOFTWARE</span>
-          <span>•</span>
-          <span>Owner: <strong className="text-slate-300">Muhammad Waqas</strong> (03228570782)</span>
+        {/* Tab 2: Master Admin Login */}
+        {activeTab === 'MASTER_ADMIN' && (
+          <form onSubmit={handleMasterAdminLogin} className="p-6 space-y-4 text-xs">
+            {adminError && (
+              <div className="p-3 rounded-xl bg-red-950/80 border border-red-500/40 text-red-200 flex items-start gap-2.5">
+                <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <span>{adminError}</span>
+              </div>
+            )}
+
+            {adminLockout.isLocked && (
+              <div className="p-3 rounded-xl bg-amber-950/80 border border-amber-500/40 text-amber-200 flex items-center gap-2.5">
+                <Clock className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>Locked due to failed attempts. Try again in {formatLockoutTime(adminLockout.remainingSeconds)}</span>
+              </div>
+            )}
+
+            <div>
+              <label className="block text-slate-300 font-semibold mb-1">
+                Master Admin Username
+              </label>
+              <input
+                type="text"
+                required
+                disabled={adminLockout.isLocked}
+                value={adminUsername}
+                onChange={(e) => setAdminUsername(e.target.value.toLowerCase())}
+                placeholder="e.g. admin"
+                className="w-full px-3.5 py-2.5 rounded-xl bg-slate-800/80 border border-slate-700 text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 text-xs font-mono"
+              />
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-slate-300 font-semibold">
+                  Master Password
+                </label>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowResetPasswordModal(true)}
+                    className="text-[11px] font-bold text-emerald-400 hover:text-emerald-300 inline-flex items-center gap-1 cursor-pointer transition"
+                    title="Open Reset Master Password screen"
+                  >
+                    <RotateCcw className="w-3 h-3 text-emerald-400" />
+                    <span>Reset Master Password</span>
+                  </button>
+                  <span className="text-slate-600">•</span>
+                  <button
+                    type="button"
+                    onClick={() => setShowRecoveryModal(true)}
+                    className="text-[11px] text-teal-400 hover:text-teal-300 font-medium cursor-pointer"
+                  >
+                    Forgot?
+                  </button>
+                </div>
+              </div>
+              <div className="relative">
+                <input
+                  type={showAdminPassword ? 'text' : 'password'}
+                  required
+                  disabled={adminLockout.isLocked}
+                  value={adminPassword}
+                  onChange={(e) => setAdminPassword(e.target.value)}
+                  placeholder="Enter Master Admin password"
+                  className="w-full px-3.5 py-2.5 pr-10 rounded-xl bg-slate-800/80 border border-slate-700 text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 text-xs"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowAdminPassword(!showAdminPassword)}
+                  className="absolute right-3 top-2.5 text-slate-400 hover:text-white"
+                >
+                  {showAdminPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={adminLoading || adminLockout.isLocked}
+              className="w-full py-3 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold transition shadow-lg shadow-emerald-950 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Lock className="w-4 h-4" />
+              <span>{adminLoading ? 'Verifying...' : 'Access Master Admin Dashboard'}</span>
+              <ArrowRight className="w-4 h-4" />
+            </button>
+
+            <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowResetPasswordModal(true)}
+                className="w-full sm:flex-1 py-2 px-3 rounded-xl bg-slate-800/90 hover:bg-slate-800 border border-emerald-500/40 text-emerald-300 hover:text-emerald-200 text-xs font-bold inline-flex items-center justify-center gap-1.5 transition cursor-pointer shadow-sm"
+              >
+                <RotateCcw className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Reset Master Password</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowRecoveryModal(true)}
+                className="w-full sm:w-auto py-2 px-3 rounded-xl bg-slate-800/40 hover:bg-slate-800 border border-slate-700/60 text-slate-400 hover:text-slate-200 text-xs font-medium inline-flex items-center justify-center gap-1.5 transition cursor-pointer"
+              >
+                <KeyRound className="w-3.5 h-3.5 text-teal-400" />
+                <span>Recovery Wizard</span>
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* Footer info */}
+        <div className="px-6 py-3 bg-slate-950/60 border-t border-slate-800/80 flex items-center justify-between text-[10px] text-slate-400">
+          <span className="flex items-center gap-1">
+            <HardDrive className="w-3 h-3 text-emerald-400" />
+            100% Offline Local Device Storage
+          </span>
+          <span className="font-mono text-slate-400">v2.0-private</span>
         </div>
+      </div>
 
-        <button
-          type="button"
-          onClick={() => setServerModalOpen(true)}
-          className="px-3 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700/90 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer"
-          title="Configure live Backend Server URL if deploying across different domains"
-        >
-          <Server className="w-3.5 h-3.5 text-emerald-400" />
-          <span>Server: {currentServerUrl ? currentServerUrl.replace(/^https?:\/\//, '') : 'Same-Origin (/api)'}</span>
-          <span className="text-[10px] bg-slate-700 px-1.5 py-0.5 rounded text-amber-300 font-mono">Settings</span>
-        </button>
-      </footer>
-
-      {/* Backend Server Connection Modal */}
-      <ServerConnectionModal
-        isOpen={serverModalOpen}
-        onClose={() => setServerModalOpen(false)}
-        onSaved={(newUrl) => {
-          setCurrentServerUrl(newUrl);
-          setAdminError(null);
-          setShopError(null);
+      {/* Modals */}
+      <MasterAdminSetupModal
+        isOpen={showSetupModal}
+        onSuccess={(user, token) => {
+          setIsConfigured(true);
+          setShowSetupModal(false);
+          onMasterAdminSuccess(user, token);
         }}
       />
 
-      {/* ============================================================== */}
-      {/* FORGOT PASSWORD MODAL (2-STEP VERIFICATION)                    */}
-      {/* ============================================================== */}
-      {forgotModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-md bg-slate-900 border border-slate-700 rounded-3xl shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-            {/* Modal Header */}
-            <div className="bg-slate-800 px-6 py-4 flex items-center justify-between border-b border-slate-700">
-              <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center">
-                  <KeyRound className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="font-bold text-base text-white">Reset Account Password</h3>
-                  <p className="text-xs text-slate-400">
-                    {forgotRole === 'SUPER_ADMIN' ? 'Super Admin Portal' : 'Shop Owner Portal'}
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => setForgotModalOpen(false)}
-                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-700 transition-colors cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
+      <MasterAdminRecoveryModal
+        isOpen={showRecoveryModal}
+        onClose={() => setShowRecoveryModal(false)}
+        onSuccess={(newUser) => {
+          setAdminUsername(newUser);
+          setShowRecoveryModal(false);
+          setActiveTab('MASTER_ADMIN');
+        }}
+      />
 
-            {/* Modal Body */}
-            <div className="p-6 space-y-4">
-              {forgotMessage && (
-                <div
-                  className={`p-3 rounded-xl text-xs flex items-start gap-2 ${
-                    forgotMessage.isError
-                      ? 'bg-red-950/60 border border-red-500/40 text-red-200'
-                      : 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
-                  }`}
-                >
-                  {forgotMessage.isError ? (
-                    <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                  ) : (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                  )}
-                  <span>{forgotMessage.text}</span>
-                </div>
-              )}
-
-              {forgotStep === 'request' ? (
-                <form onSubmit={handleRequestResetCode} className="space-y-4">
-                  <p className="text-xs text-slate-300 leading-relaxed">
-                    Enter your registered email address to receive a secure 6-digit verification code.
-                  </p>
-
-                  <div className="space-y-1">
-                    <label className="text-xs font-bold text-slate-300">Registered Email</label>
-                    <div className="relative">
-                      <input
-                        type="email"
-                        value={forgotEmail}
-                        onChange={(e) => setForgotEmail(e.target.value)}
-                        placeholder="e.g. waqaspos.admin@gmail.com"
-                        required
-                        className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs font-semibold text-white focus:outline-hidden focus:ring-2 focus:ring-amber-500"
-                      />
-                      <Mail className="w-4 h-4 text-slate-500 absolute left-3 top-3 pointer-events-none" />
-                    </div>
-                  </div>
-
-                  <div className="flex gap-2 justify-end pt-2">
-                    <button
-                      type="button"
-                      onClick={() => setForgotModalOpen(false)}
-                      className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition-colors cursor-pointer"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="submit"
-                      disabled={forgotLoading}
-                      className="px-5 py-2.5 bg-amber-600 hover:bg-amber-500 active:scale-95 text-slate-950 font-black rounded-xl text-xs transition-all cursor-pointer disabled:opacity-50"
-                    >
-                      {forgotLoading ? 'Generating...' : 'Get Verification Code'}
-                    </button>
-                  </div>
-                </form>
-              ) : (
-                <form onSubmit={handleConfirmResetPassword} className="space-y-4">
-                  {generatedResetCode && (
-                    <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-center space-y-1">
-                      <span className="text-[10px] text-amber-300 uppercase tracking-widest font-black">
-                        Self-Hosted Verification Code
-                      </span>
-                      <div className="text-2xl font-black text-amber-400 tracking-widest font-mono">
-                        {generatedResetCode}
-                      </div>
-                      <p className="text-[11px] text-slate-400">
-                        In production, this code is sent to your registered WhatsApp / Email.
-                      </p>
-                    </div>
-                  )}
-
-                  <div className="space-y-1">
-                    <label className="text-xs font-bold text-slate-300">Enter 6-Digit Code</label>
-                    <input
-                      type="text"
-                      value={resetCodeInput}
-                      onChange={(e) => setResetCodeInput(e.target.value)}
-                      placeholder="e.g. 123456"
-                      required
-                      className="w-full px-3 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm font-bold text-center text-white tracking-widest focus:outline-hidden focus:ring-2 focus:ring-amber-500"
-                    />
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="text-xs font-bold text-slate-300">New Password</label>
-                    <input
-                      type="password"
-                      value={newPasswordInput}
-                      onChange={(e) => setNewPasswordInput(e.target.value)}
-                      placeholder="Enter at least 6 characters"
-                      required
-                      className="w-full px-3 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs font-semibold text-white focus:outline-hidden focus:ring-2 focus:ring-amber-500"
-                    />
-                  </div>
-
-                  <div className="flex gap-2 justify-end pt-2">
-                    <button
-                      type="button"
-                      onClick={() => setForgotStep('request')}
-                      className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition-colors cursor-pointer"
-                    >
-                      Back
-                    </button>
-                    <button
-                      type="submit"
-                      disabled={forgotLoading}
-                      className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-black rounded-xl text-xs transition-all cursor-pointer disabled:opacity-50"
-                    >
-                      {forgotLoading ? 'Updating...' : 'Set New Password'}
-                    </button>
-                  </div>
-                </form>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+      <ResetMasterPasswordModal
+        isOpen={showResetPasswordModal}
+        onClose={() => setShowResetPasswordModal(false)}
+        initialUsername={adminUsername}
+        onSuccess={(newUser) => {
+          setAdminUsername(newUser);
+          setShowResetPasswordModal(false);
+          setAdminPassword('');
+          setAdminError(null);
+          setActiveTab('MASTER_ADMIN');
+        }}
+      />
     </div>
   );
 };

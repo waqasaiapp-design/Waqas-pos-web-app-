@@ -127,7 +127,7 @@ export const HomePage: React.FC<HomePageProps> = ({
   onOpenReceiptDesigner,
   onOpenResetSystem,
   onLogout,
-  authRole = 'Super Admin',
+  authRole = 'Master Admin',
   authEmail,
   shopId = 'WM001',
 }) => {

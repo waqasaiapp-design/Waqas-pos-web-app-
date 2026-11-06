@@ -222,7 +222,7 @@ export interface UserProfile {
   displayName: string;
   email?: string;
   phone?: string;
-  role: 'Owner / Super Admin' | 'Store Manager' | 'Head Cashier' | 'Cashier';
+  role: 'Master Admin' | 'Store Manager' | 'Head Cashier' | 'Cashier';
   avatarUrl?: string;
   createdAt: string;
 }
@@ -616,7 +616,7 @@ export interface StaffMember {
 // 7. SUPER ADMIN, MULTI-SHOP SUBSCRIPTIONS & PAYMENT MANAGEMENT
 // ==============================================================
 export type SubscriptionPlanType = '1_month' | '3_months' | '6_months' | '12_months' | 'custom';
-export type AccountStatus = 'active' | 'expiring_soon' | 'expired' | 'suspended' | 'blocked';
+export type AccountStatus = 'active' | 'inactive' | 'expiring_soon' | 'expired' | 'suspended' | 'blocked';
 export type PaymentMethodType = 'Cash' | 'Easypaisa' | 'JazzCash' | 'Bank Transfer' | 'Other';
 export type PaymentStatusType = 'Paid' | 'Partially Paid' | 'Unpaid' | 'Pending Verification';
 
@@ -691,11 +691,29 @@ export interface SubscriptionRenewalRecord {
 // ==============================================================
 // 8. MULTI-TENANT AUTHENTICATION, ROLES & AUDIT LOGS
 // ==============================================================
-export type UserRole = 'SUPER_ADMIN' | 'SHOP_OWNER' | 'STAFF';
+export type UserRole = 'MASTER_ADMIN' | 'SHOP_OWNER' | 'STAFF';
+
+export interface MasterAdminProfile {
+  id: string;
+  username: string;
+  fullName: string;
+  phone?: string;
+  whatsapp?: string;
+  createdAt: string;
+  lastLoginAt?: string;
+}
+
+export interface MasterAdminStatus {
+  isConfigured: boolean;
+  masterAdminUsername?: string;
+  totalShops: number;
+  activeShops: number;
+}
 
 export interface AuthUser {
   id: string;
-  email: string;
+  email?: string;
+  username?: string;
   fullName: string;
   phone?: string;
   whatsapp?: string;
